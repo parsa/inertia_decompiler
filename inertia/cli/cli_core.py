@@ -6637,6 +6637,13 @@ class _DirectAddrCliContext8616:
     request_cache_inputs: DirectRequestCacheInputs8616
 
 
+
+def _cli_runtime_header_8616(target: object) -> object:
+    """Render the ordinary CLI header with its active word-frame profile."""
+    return render_c_runtime_header_8616(
+        target, word_far_return=os.getenv("INERTIA_EXPERIMENTAL_WORD_FAR_RETURN") == "1",
+    )
+
 @cython.ccall
 def _direct_request_cache_artifact_for_result_8616(
     context: _DirectAddrCliContext8616,
@@ -6691,7 +6698,7 @@ def _direct_request_cache_artifact_for_result_8616(
         function_name=function_name,
         arch_name=context.project.arch.name,
         entry_point=context.project.entry,
-        runtime_header=render_c_runtime_header_8616(context.args.c_target),
+        runtime_header=_cli_runtime_header_8616(context.args.c_target),
         startup_diagnostic_lines=tuple(startup_diagnostic_lines),
         payload=result.payload,
         tail_validation=copy.deepcopy(tail_validation),
@@ -7399,7 +7406,7 @@ class _DirectAddrCliRun8616:
                         flush=True,
                     )
                 else:
-                    self.expected_runtime_header = render_c_runtime_header_8616(self.args.c_target)
+                    self.expected_runtime_header = _cli_runtime_header_8616(self.args.c_target)
                 if declared_consumption_ok and (
                     operator.eq(self.artifact.arch_name, self.project.arch.name)
                     and operator.eq(self.artifact.entry_point, self.project.entry)
@@ -11110,7 +11117,7 @@ class _MainCliRun8616:
         """Run an extracted `_run_main_cli_8616` phase; return an exit code to abort."""
         self.args, self.timeout_was_explicit, self.effective_signature_catalog = _prepare_main_cli_args_8616(self.argv)
         print(f"/* loading: {self.args.binary} */", flush=True)
-        self.runtime_header = render_c_runtime_header_8616(self.args.c_target)
+        self.runtime_header = _cli_runtime_header_8616(self.args.c_target)
         if self.runtime_header:
             print(self.runtime_header, end="" if self.runtime_header.endswith("\n") else "\n", flush=True)
         try:

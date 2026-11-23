@@ -55,7 +55,7 @@ from .gp_register_versions import (
 from .gp_word_assignment import project_gp_word_assignment_8616, refresh_gp_word_pointer_projection_8616
 from .gp_word_runtime import initialize_gp_runtime_abi_8616
 from .stack_value_projection import project_pointer_storage_value_8616
-from .terminal_return_expressions import contains_effectful_call_8616
+from .terminal_return_expressions import contains_register_clobbering_call_8616
 import dataclasses
 import operator
 import builtins
@@ -965,7 +965,7 @@ def _entry_version_placement_8616(
             read_position + _ENTRY_STORE_PHASE
             if terminal_frame or order is RegisterUpdateOrder8616.READS_BEFORE_WRITE else read_position
         )
-        if contains_effectful_call_8616(statement):
+        if contains_register_clobbering_call_8616(statement):
             for parent in state_owned_names:
                 first_write.setdefault(parent, write_position if terminal_frame else read_position)
         for node in _iter_c_nodes_deep_8616(statement):

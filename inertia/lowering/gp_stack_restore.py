@@ -35,6 +35,7 @@ from inertia.lowering.c_ast_utils import _iter_c_nodes_deep_8616, _replace_c_chi
 from inertia.pipeline.errors import PipelineHardError
 
 from .gp_constant_restore import ConstantRestorePublication8616, publish_constant_gp_restore_8616
+from .gp_push_store import GPPushStoreResult8616, preserve_gp_push_store_8616
 from .gp_register_state import runtime_gp_state_expr_8616
 from .gp_stack_local_reload import has_materialized_gp_local_reload_8616
 from .gp_stack_local_return import has_materialized_gp_local_return_8616
@@ -549,6 +550,7 @@ def materialize_gp_stack_restores_8616(codegen: object) -> cython.bint:
         if isinstance(statement.lhs, structured_c.CVariable)
     ]
     newly_materialized = 0
+    push_changed = False
     for fact in facts:
         assert fact.saved_instruction_addr is not None
         key = (
@@ -556,6 +558,8 @@ def materialize_gp_stack_restores_8616(codegen: object) -> cython.bint:
             fact.restore_instruction_addr,
             fact.restore_register,
         )
+        push_store = preserve_gp_push_store_8616(codegen, artifact.source_artifact, fact)
+        push_changed = push_changed or push_store is GPPushStoreResult8616.INSERTED
         if key in completed_pairs:
             continue
         constant_publication = publish_constant_gp_restore_8616(codegen, containers, fact, cfunc.addr)
@@ -642,4 +646,4 @@ def materialize_gp_stack_restores_8616(codegen: object) -> cython.bint:
                 "failure_count": stats.failure_count,
             },
         )
-    return newly_materialized > 0
+    return push_changed or newly_materialized > 0

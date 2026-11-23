@@ -25,6 +25,7 @@ from inertia.lowering.c_ast_utils import _iter_c_nodes_deep_8616
 from inertia.semantics.register_definition_return import RegisterReturnPath8616, unchanged_register_return_path_8616
 
 from .codegen_return_origin import return_value_origin_8616
+from .gp_push_store import authenticated_entry_push_statements_8616
 from .gp_stack_local_reload import _exact_local, _stores_for_local
 from .gp_stack_restore_identity import _entry_sp_byte_offset_8616, _unconditional_sequence_8616, _unique_byte_save_8616
 from .segment_access_policy import instruction_addrs_from_node_8616
@@ -115,9 +116,14 @@ def _initialized_binding(
         return False
     if not any(candidate is save for candidate in iter(prefix)):
         return False
-    unconditional = all(isinstance(candidate, structured_c.CAssignment) for candidate in iter(prefix))
+    source = cast(_CodegenSurface8616, codegen)._inertia_vex_ir_artifact
+    assert isinstance(source, IRFunctionArtifact)
+    physical = authenticated_entry_push_statements_8616(codegen, source)
+    private_prefix = tuple(candidate for candidate in iter(prefix) if id(candidate) not in physical)
+    unconditional = all(isinstance(candidate, structured_c.CAssignment) for candidate in iter(private_prefix))
     no_calls = not any(isinstance(node, structured_c.CFunctionCall)
-                       for statement in iter(prefix) for node in builtins.iter(_iter_c_nodes_deep_8616(statement)))
+                       for statement in iter(private_prefix)
+                       for node in builtins.iter(_iter_c_nodes_deep_8616(statement)))
     return unconditional and no_calls
 
 

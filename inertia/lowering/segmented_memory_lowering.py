@@ -46,6 +46,7 @@ from .gp_register_state import (
     GPRegisterStateLoweringStats8616,
     lower_architectural_gp_register_state_8616,
 )
+from .gp_push_store import preserve_entry_bp_push_store_8616
 from .gp_stack_restore import materialize_gp_stack_restores_8616
 from .linear_global_decomposition_cache import (
     LinearGlobalDecompositionCache8616,
@@ -2969,7 +2970,8 @@ def replay_final_codegen_projections_8616(codegen: object) -> cython.bint:
     scalar_values_changed = normalize_pointer_scalar_temporaries_8616(codegen)
     gp_state_changed = bool(lower_architectural_gp_register_state_8616(codegen))
     gp_stack_changed = bool(materialize_gp_stack_restores_8616(codegen))
-    return flags_changed or scalar_values_changed or gp_state_changed or gp_stack_changed
+    bp_push_changed = preserve_entry_bp_push_store_8616(codegen)
+    return flags_changed or scalar_values_changed or gp_state_changed or gp_stack_changed or bp_push_changed
 
 
 @cython.ccall
@@ -3091,7 +3093,7 @@ def _runtime_lowering_late_passes_b_8616(
     # GP binding consumes stack variables, including whole-word local reloads.
     # Validate only after the SS access and lvalue projections exist.
     changed = materialize_gp_stack_restores_8616(codegen) or changed
-    return changed
+    return preserve_entry_bp_push_store_8616(codegen) or changed
 
 
 @cython.ccall

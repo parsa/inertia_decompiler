@@ -39,7 +39,7 @@ from inertia.pipeline.errors import PipelineHardError
 
 from .gp_register_entry_flow import build_gp_entry_flow_8616
 from .stack_value_projection import project_pointer_storage_value_8616
-from .terminal_return_expressions import contains_effectful_call_8616
+from .terminal_return_expressions import contains_register_clobbering_call_8616
 import dataclasses
 import operator
 import builtins
@@ -199,12 +199,12 @@ class _CaptureScan8616:
 
     @cython.ccall
     def clobbers(self, statement: object) -> cython.bint:
-        """Return whether the subtree holds an effectful call, memoized per node."""
+        """Return whether the subtree may clobber GP state by calling guest code."""
         cached: object
         marker = id(statement)
         cached = self._effectful.get(marker)
         if cached is None or cached[0] is not statement:
-            cached = (statement, contains_effectful_call_8616(statement))
+            cached = (statement, contains_register_clobbering_call_8616(statement))
             self._effectful[marker] = cached
         return cached[1]
 

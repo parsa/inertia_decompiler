@@ -39,6 +39,7 @@ import builtins
 
 __all__ = [
     "contains_effectful_call_8616",
+    "contains_register_clobbering_call_8616",
     "resolve_current_stack_copy_return_8616",
     "resolve_linear_virtual_return_expression_8616",
     "return_expression_contains_dereference_8616",
@@ -64,6 +65,17 @@ def contains_effectful_call_8616(node: object) -> cython.bint:
     return any(
         isinstance(candidate, structured_c.CFunctionCall) and _call_is_effectful_8616(candidate)
         for candidate in iter(nodes)
+    )
+
+
+def contains_register_clobbering_call_8616(node: object) -> cython.bint:
+    """Exclude owned physical stack writes from the opaque CALL clobber model."""
+    from .gp_push_store import is_physical_gp_push_call_8616
+
+    return any(
+        isinstance(candidate, structured_c.CFunctionCall) and _call_is_effectful_8616(candidate)
+        and not is_physical_gp_push_call_8616(candidate)
+        for candidate in iter(_iter_c_nodes_deep_8616(node))
     )
 
 

@@ -205,15 +205,9 @@ def render_near_pointer_arithmetic_macros_8616(target: object) -> object:
     )
 
 
-@cython.ccall
-def render_word_far_return_runtime_8616() -> str:
-    """Render the word RETF runtime primitive after the segmented macros."""
-    iret = WordInterruptReturnLayout8616
+def _render_word_push_runtime_8616() -> str:
+    """Render common physical stack writes after the segmented macros."""
     return (
-        "extern uint16_t inertia_ip;\n"
-        "#ifndef INERTIA_RETF_BYTE\n"
-        "#define INERTIA_RETF_BYTE(ss, off) (*(volatile uint8_t far *)SEG_PTR((ss), (off)))\n"
-        "#endif\n"
         "#ifndef INERTIA_CALL_FRAME_WRITE\n"
         "#define INERTIA_CALL_FRAME_WRITE(ss, off, byte) (*(volatile uint8_t far *)SEG_PTR((ss), (off)) = (byte))\n"
         "#endif\n"
@@ -224,6 +218,18 @@ def render_word_far_return_runtime_8616() -> str:
         "    INERTIA_CALL_FRAME_WRITE(ss, (uint16_t)(sp + 1u), (uint8_t)(value >> 8));\n"
         "    return sp;\n"
         "}\n"
+    )
+
+
+@cython.ccall
+def render_word_far_return_runtime_8616() -> str:
+    """Render the word RETF runtime primitive after the segmented macros."""
+    iret = WordInterruptReturnLayout8616
+    return (
+        "extern uint16_t inertia_ip;\n"
+        "#ifndef INERTIA_RETF_BYTE\n"
+        "#define INERTIA_RETF_BYTE(ss, off) (*(volatile uint8_t far *)SEG_PTR((ss), (off)))\n"
+        "#endif\n"
         "static uint16_t inertia_stack_read_word(uint16_t ss, uint16_t sp)\n"
         "{\n"
         "    uint16_t value = INERTIA_RETF_BYTE(ss, sp);\n"
@@ -325,6 +331,7 @@ def render_c_runtime_header_8616(
             f"{render_pointer_storage_macros_8616(normalized)}"
             f"{render_near_pointer_arithmetic_macros_8616(normalized)}"
             f"{render_near_pointer_argument_runtime_8616(normalized)}"
+            f"{_render_word_push_runtime_8616()}"
             f"{far_return_runtime}"
         )
     if normalized == "portable-flat":
@@ -360,6 +367,7 @@ def render_c_runtime_header_8616(
             f"{render_pointer_storage_macros_8616(normalized)}"
             f"{render_near_pointer_arithmetic_macros_8616(normalized)}"
             f"{render_near_pointer_argument_runtime_8616(normalized)}"
+            f"{_render_word_push_runtime_8616()}"
             f"{far_return_runtime}"
         )
     return gp_header

@@ -1,4 +1,8 @@
-"""Retain physical SS accesses for a proven word BP frame."""
+"""Retain physical SS accesses for a proven word BP frame.
+
+Layer: Types/Lowering.
+Responsibility: project the Alias-proven frame's physical save and reload.
+"""
 import os
 
 from angr.analyses.decompiler.structured_codegen import c
@@ -11,11 +15,12 @@ from .entry_stack_pointer_capture import (
     entry_stack_pointer_projection_8616,
     observe_entry_stack_pointer_capture_8616,
 )
+from .gp_push_store import PUSH_WORD_HELPER_8616, tag_physical_gp_push_8616
 from .gp_register_state import runtime_gp_state_assignment_8616, runtime_gp_state_expr_8616
 from .segment_register_state import runtime_segment_state_cvar_8616
 
 
-def lower_word_bp_frame_8616(codegen):
+def lower_word_bp_frame_8616(codegen: c.CStructuredCodeGenerator) -> bool:
     """Replace a pair of private byte carriers and their only restore."""
     if os.getenv("INERTIA_EXPERIMENTAL_WORD_FAR_RETURN") != "1":
         return False
@@ -65,7 +70,8 @@ def lower_word_bp_frame_8616(codegen):
     bp = runtime_gp_state_expr_8616("bp", codegen=codegen, function_addr=function.addr)
     if ss is None or bp is None:
         return False
-    push = c.CFunctionCall("inertia_push_word", None, [ss, capture.value, bp], codegen=codegen)
+    push = c.CFunctionCall(PUSH_WORD_HELPER_8616, None, [ss, capture.value, bp], codegen=codegen)
+    tag_physical_gp_push_8616(push, frame.push)
     install = runtime_gp_state_assignment_8616(
         "bp", c.CTypeCast(push.type, word, push, codegen=codegen),
         codegen=codegen, function_addr=function.addr,

@@ -1,0 +1,110 @@
+{
+  "closed": true,
+  "accesses": [
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170905,
+        "insn_addr": 170905,
+        "access_ordinal": 0
+      },
+      "kind": "write",
+      "space": "ss",
+      "base": [
+        "sp"
+      ],
+      "offset": -2,
+      "size": 2
+    },
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170905,
+        "insn_addr": 170910,
+        "access_ordinal": 0
+      },
+      "kind": "read",
+      "space": "ss",
+      "base": [
+        "bp"
+      ],
+      "offset": 8,
+      "size": 2
+    },
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170916,
+        "insn_addr": 170916,
+        "access_ordinal": 0
+      },
+      "kind": "read",
+      "space": "ds",
+      "base": [
+        "bx"
+      ],
+      "offset": 0,
+      "size": 2
+    },
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170922,
+        "insn_addr": 170923,
+        "access_ordinal": 0
+      },
+      "kind": "read",
+      "space": "ss",
+      "base": [
+        "bp"
+      ],
+      "offset": 6,
+      "size": 2
+    },
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170928,
+        "insn_addr": 170929,
+        "access_ordinal": 0
+      },
+      "kind": "read",
+      "space": "ss",
+      "base": [
+        "sp"
+      ],
+      "offset": 0,
+      "size": 2
+    },
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170928,
+        "insn_addr": 170930,
+        "access_ordinal": 0
+      },
+      "kind": "read",
+      "space": "ss",
+      "base": [
+        "sp"
+      ],
+      "offset": 0,
+      "size": 2
+    },
+    {
+      "key": {
+        "function_addr": 170905,
+        "block_addr": 170928,
+        "insn_addr": 170930,
+        "access_ordinal": 1
+      },
+      "kind": "read",
+      "space": "ss",
+      "base": [
+        "sp"
+      ],
+      "offset": 2,
+      "size": 2
+    }
+  ]
+}
