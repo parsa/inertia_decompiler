@@ -185,6 +185,7 @@ from .ir_boundary_cfg import (
     IRBoundaryCoverageResult8616,
     _instruction_census_matches_8616,
     closed_ir_boundary_cfg_8616,
+    declared_provisional_relative_geometry_8616,
 )
 from .real16_boot_entry_link import (
     RawBootEntrySurface8616,
@@ -8399,13 +8400,20 @@ def _derive_census_surface_8616(
             or not isinstance(
                 candidate_boundary, ExactFunctionRangeBoundary8616
             )
-            or not closed_ir_boundary_cfg_8616(
-                candidate_boundary, candidate_artifact
-            )
-            or not _instruction_census_matches_8616(
-                candidate_boundary, candidate_artifact
-            )
+            or not _instruction_census_matches_8616(candidate_boundary, candidate_artifact)
         ):
+            return Real16InvocationFailure8616.COVERAGE_UNBOUND
+        from inertia.frontend.x86_16.frontend_instruction_reachability import (
+            ConditionalRelativeEdge8616,
+        )
+
+        if type(chain) is DeclaredFunctionEntryLink8616 and any(
+            isinstance(edge, ConditionalRelativeEdge8616) for edge in iter(candidate_boundary.conditional_edges)
+        ):
+            geometry_bound = declared_provisional_relative_geometry_8616(candidate_boundary, candidate_artifact)
+        else:
+            geometry_bound = closed_ir_boundary_cfg_8616(candidate_boundary, candidate_artifact)
+        if not geometry_bound:
             return Real16InvocationFailure8616.COVERAGE_UNBOUND
         return candidate_artifact, candidate_boundary
     return Real16InvocationFailure8616.COVERAGE_UNBOUND

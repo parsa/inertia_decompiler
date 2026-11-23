@@ -33,6 +33,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
 from inertia.frontend.x86_16.frontend_function_boundary import ExactFunctionRangeBoundary8616
+from inertia.frontend.x86_16.frontend_instruction_reachability import (
+    ConditionalRelativeEdge8616,
+    collect_instruction_reachability_8616,
+)
 
 from .core import IRFunctionArtifact
 from .entry_projection_mode import EntryProjectionMode8616
@@ -176,6 +180,58 @@ def closed_ir_boundary_cfg_8616(
             for block in iter(artifact.blocks)
             for successor in iter(block.successor_addrs)
         ),
+    )
+
+
+def declared_provisional_relative_geometry_8616(
+    boundary: ExactFunctionRangeBoundary8616, artifact: IRFunctionArtifact,
+) -> bool:
+    """Bind a declared-entry census without granting its pending JMP an IR successor.
+
+    This is geometry for in-flight entry seeding only, never universal or
+    scoped coverage. The declared pipeline must separately prove and apply
+    the transfer under the identical consuming invocation.
+    """
+    from .entry_jump_domain import collect_pending_terminal_jumps_8616
+    from .real16_invocation_domain import _nested_capture_admitted_8616
+    from .vex_import import raw_x86_16_import_bundle_for_artifact_8616
+
+    if len(boundary.conditional_edges) != 1:
+        return False
+    edge = boundary.conditional_edges[0]
+    if not isinstance(edge, ConditionalRelativeEdge8616) or edge.block_addr != boundary.addr:
+        return False
+    units = len(boundary.block_addrs_set) + len(boundary.reachable_instruction_addrs)
+    if not _nested_capture_admitted_8616(units):
+        return False
+    fresh = collect_instruction_reachability_8616(
+        boundary.project, entry=boundary.addr, region_start=boundary.decode_start, region_end=boundary.decode_end,
+        conditional_edges=(edge,),
+    )
+    if (
+        not fresh.inventory_complete or fresh.complete or fresh.conditional_edges[0] is not edge
+        or tuple(fresh.successor_edges) != tuple(boundary.successor_edges)
+        or frozenset(fresh.reachable_block_addrs) != boundary.block_addrs_set
+        or frozenset(fresh.reachable_instruction_addrs) != boundary.reachable_instruction_addrs
+    ):
+        return False
+    blocks = {block.addr: block for block in iter(artifact.blocks)}
+    root = blocks.get(edge.block_addr)
+    if (len(blocks) != len(artifact.blocks) or root is None or root.successor_addrs or not root.instrs
+            or root.instrs[-1].addr != edge.instruction_addr or root.instrs[-1].op != "JMP"
+            or len(root.instrs[-1].args) != 1):
+        return False
+    bundle = raw_x86_16_import_bundle_for_artifact_8616(boundary.project, boundary, artifact)
+    if bundle is None or bundle.artifact is not artifact:
+        return False
+    pending = collect_pending_terminal_jumps_8616(bundle.terminal_evidence)
+    terminal = pending.get(edge.block_addr)
+    if len(pending) != 1 or terminal is None or not edge.matches_terminal(terminal.decoded):
+        return False
+    raw_edges = frozenset((block.addr, successor) for block in iter(artifact.blocks)
+                          for successor in iter(block.successor_addrs))
+    return _closed_boundary_census_8616(
+        artifact.function_addr, boundary, frozenset(blocks), raw_edges | {(edge.block_addr, edge.target_addr)},
     )
 
 

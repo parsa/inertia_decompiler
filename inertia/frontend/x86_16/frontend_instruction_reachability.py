@@ -31,11 +31,14 @@ from .frontend_block_partition import (
 )
 from .frontend_capstone_decode import DirectCapstoneBlock8616
 from .frontend_instruction_kinds import is_x86_16_call_mnemonic_8616
+from .frontend_near_return_continuation import NearCallFramePremise8616
+from .relative_control_edge import DecodedRelativeEdge, decode_relative_edge
 import dataclasses
 import operator
 import builtins
 
 __all__ = [
+    "ConditionalRelativeEdge8616",
     "DecodedBlockRequest8616",
     "DecodedBlockStatus8616",
     "InstructionReachabilityEvidence8616",
@@ -65,7 +68,8 @@ class _InstructionBoundary8616(Protocol):
     """angr wrapper fields for one decoded Capstone instruction."""
 
     address: cython.longlong
-    mnemonic: object
+    mnemonic: str
+    bytes: bytes | bytearray
     insn: _DecodedInstructionBoundary8616
 
 
@@ -96,6 +100,23 @@ class ConditionalIndirectEdge8616:
     block_addr: cython.longlong
     instruction_addr: cython.longlong
     target_addr: cython.longlong
+
+
+@dataclasses.dataclass(frozen=True, )
+class ConditionalRelativeEdge8616:
+    """One source-authenticated entry JMP destination for decoding only."""
+
+    project: object = dataclass_field(compare=False, repr=False)
+    block_addr: cython.longlong
+    instruction_addr: cython.longlong
+    target_addr: cython.longlong
+    decoded: DecodedRelativeEdge
+    block_encoding: bytes
+    premise: NearCallFramePremise8616 = dataclass_field(compare=False, repr=False)
+
+    def matches_terminal(self, decoded: DecodedRelativeEdge) -> bool:
+        """Compare exact native identity, not the decoder's diagnostic label."""
+        return self.instruction_addr == self.decoded.head == decoded.head and self.decoded.encoding == decoded.encoding
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,11 +158,11 @@ class InstructionReachabilityEvidence8616:
     block_partition: FrontendBlockPartitionArtifact8616 | None = dataclass_field(
         default=None, compare=False, repr=False,
     )
-    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalDosExit8616, ...] = ()
+    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalRelativeEdge8616 | ConditionalDosExit8616, ...] = ()
 
     @property
     def complete(self) -> cython.bint:
-        """Require a closed census without unproved indirect-edge assumptions."""
+        """Require a closed census without provisional decoding assumptions."""
         return not self.conditional_edges and self.inventory_complete
 
     @property
@@ -233,6 +254,23 @@ def x86_16_block_successors_from_capstone_8616(
             return set(), True
     if not instructions:
         return set(), True
+    last = cast(_InstructionBoundary8616, instructions[-1])
+    relative_edges = tuple(edge for edge in iter(conditional_edges)
+                           if isinstance(edge, ConditionalRelativeEdge8616) and edge.block_addr == boundary.addr)
+    if relative_edges:
+        if len(relative_edges) != 1:
+            return set(), True
+        edge = relative_edges[0]
+        if (
+            last.mnemonic.lower() != "jmp"
+            or edge.instruction_addr != last.address
+            or edge.block_encoding != b"".join(bytes(insn.bytes) for insn in iter(instructions))
+            or edge.decoded != decode_relative_edge(last.address, bytes(last.bytes))
+            or not region_start <= edge.target_addr < region_end
+            or any(other is not edge and other.block_addr == boundary.addr for other in iter(conditional_edges))
+        ):
+            return set(), True
+        return {edge.target_addr}, False
     dos_exits = [edge for edge in iter(conditional_edges)
                  if isinstance(edge, ConditionalDosExit8616) and edge.block_addr == boundary.addr]
     if dos_exits:
@@ -240,7 +278,6 @@ def x86_16_block_successors_from_capstone_8616(
             boundary, instructions, dos_exits[0],
         )
 
-    last = cast(_InstructionBoundary8616, instructions[-1])
     return _terminal_successors_8616(
         boundary,
         last.mnemonic.lower(),
@@ -365,6 +402,36 @@ def _visit_reachable_block_8616(
     return tuple(sorted(successors))
 
 
+def _relative_census_current_8616(
+    project: object, entry: int, edge: ConditionalRelativeEdge8616, blocks: dict[int, object],
+) -> bool:
+    """Reauthenticate the candidate and the uniquely owned live decoded spans."""
+    from angr import Project
+
+    from .frontend_cfg_direct_jump import (
+        _mapped_span_8616,
+        prove_near_call_relative_edge_8616,
+    )
+
+    if not isinstance(project, Project) or edge.project is not project or edge.block_addr != entry:
+        return False
+    if prove_near_call_relative_edge_8616(project, edge.premise) != edge or edge.target_addr not in blocks:
+        return False
+    entry_span = _mapped_span_8616(project, entry, len(edge.block_encoding))
+    if entry_span is None:
+        return False
+    for addr, block in blocks.items():
+        native = cast(_BlockBoundary8616, block)
+        instructions = native.capstone.insns
+        encoding = b"".join(bytes(insn.bytes) for insn in iter(instructions))
+        span = _mapped_span_8616(project, addr, len(encoding))
+        if (span is None or span.owner is not entry_span.owner or span.encoding != encoding
+                or len(encoding) != native.size
+                or any(project.is_hooked(insn.address) for insn in iter(instructions))):
+            return False
+    return True
+
+
 def collect_instruction_reachability_8616(
     project: object,
     *,
@@ -387,11 +454,13 @@ def collect_instruction_reachability_8616(
     if not (region_start <= entry < region_end):
         return InstructionReachabilityEvidence8616((), (), (), (), 0, 0, 0, 0, 0)
 
-    cache = _reachability_cache_8616(project)
+    relative_edges = tuple(edge for edge in iter(conditional_edges) if isinstance(edge, ConditionalRelativeEdge8616))
+    cache = None if relative_edges else _reachability_cache_8616(project)
     cache_key = (entry, region_start, region_end, proven_return_block_addrs, conditional_edges)
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
     queue: deque[cython.longlong] = deque((entry,))
     visited: set[cython.longlong] = set()
     reachable_instructions: set[cython.longlong] = set()
@@ -426,6 +495,10 @@ def collect_instruction_reachability_8616(
         region_end=region_end,
     )
     unresolved.update(fact.block_addr for fact in iter(partition.facts) if fact.failure is not None)
+    if relative_edges and (len(relative_edges) != 1 or not _relative_census_current_8616(
+        project, entry, relative_edges[0], reachable_blocks,
+    )):
+        unresolved.add(entry)
     if any(
         (edge.block_addr not in reachable_blocks or edge.block_addr in unresolved)
         if isinstance(edge, ConditionalDosExit8616)
@@ -450,5 +523,6 @@ def collect_instruction_reachability_8616(
         block_partition=partition,
         conditional_edges=conditional_edges,
     )
-    cache[cache_key] = evidence
+    if cache is not None:
+        cache[cache_key] = evidence
     return evidence

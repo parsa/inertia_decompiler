@@ -5,6 +5,15 @@ and terminal-return analyses live here. Implementations retain their existing
 interfaces and behavior. Historical `X86_16/semantics/` module paths are aliases
 to these owners.
 
+`CalleeStackCallResult8616.preserved_frame_far_continuation` checks the two
+saved words at every retained native RETF, in addition to the Alias return
+SP result. A lifted stack byte store is recognized only with entry SS and
+an affine word SP address. SP and each byte offset are tracked modulo 16 bits
+before real-mode physical alias comparison. Unknown addresses, saved words
+possibly changed at return, and paths without a proved return cannot supply
+a continuation.
+See `tests/semantics/test_callee_stack_effects_saved_far_frame.py`.
+
 `scoped_callee_stack_effects.py` binds one physical decoded near CALL to an
 Alias `ScopedCalleeStackPointerResult8616`: `complete_for(caller_scope,
 callee_scope)` and `return_sp_delta_for(caller_scope, callee_scope)` require

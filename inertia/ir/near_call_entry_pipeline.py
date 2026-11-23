@@ -104,7 +104,7 @@ def _installed_source_8616(project: object) -> Real16InvocationSource8616 | None
     return source
 
 
-def _incoming_rows_8616(
+def incoming_encoded_near_call_rows_8616(
     source: Real16InvocationSource8616, target: cython.longlong,
 ) -> tuple[DecodedDirectCallsite8616, ...]:
     """Select exact encoded near destinations without trusting lookup aliases."""
@@ -149,7 +149,7 @@ class NativeNearCallPipeline8616:
                 or self.scope.project is not project
                 or installed.callsite_index is not self.scope.context.callsite_index):
             return False
-        rows = _incoming_rows_8616(self.source, self.bundle.artifact.function_addr)
+        rows = incoming_encoded_near_call_rows_8616(self.source, self.bundle.artifact.function_addr)
         return len(rows) == 1 and rows[0] is self.incoming
 
 
@@ -233,7 +233,7 @@ def _bind_context_8616(
 ) -> object:
     """Bind precisely one indexed incoming native word CALL."""
     premise: object
-    rows = _incoming_rows_8616(source, boundary.addr)
+    rows = incoming_encoded_near_call_rows_8616(source, boundary.addr)
     if not rows:
         return NearCallEntryPipelineFailure8616.ENTRY_MISSING
     if len(rows) != 1:

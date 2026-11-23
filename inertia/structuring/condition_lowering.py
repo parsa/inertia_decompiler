@@ -273,6 +273,26 @@ def lower_ir_value_to_c_expr_8616(
     return _ir_value_to_cvar_8616(value, project, codegen, resolve_register_name=resolve_register_name)
 
 
+def _projection_reads_stored_value_8616(assignment: SameBlockRegisterAssignment8616) -> bool:
+    """Use the reaching write, not an RHS that reads its previous storage value."""
+    from angr.analyses.decompiler.structured_codegen.c import CFunctionCall, CVariable
+
+    if assignment.use_stored_value:
+        return True
+    lhs = assignment.lhs
+    storage = (lhs.unified_variable or lhs.variable) if isinstance(lhs, CVariable) else None
+    for child in _iter_c_nodes_deep_8616(assignment.rhs):
+        if isinstance(child, CFunctionCall):
+            return True
+        # Separate SSA views can be coalesced to the same emitted C storage.
+        if isinstance(child, CVariable) and storage is not None and operator.eq(
+            child.unified_variable or child.variable, storage,
+        ):
+            return True
+    return False
+
+
+@cython.ccall
 def materialize_same_block_register_projection_8616(
     value: IRValue,
     condition: ConditionIR,
@@ -291,7 +311,6 @@ def materialize_same_block_register_projection_8616(
         CBinaryOp,
         CConstant,
         CExpression,
-        CFunctionCall,
     )
     from angr.sim_type import SimTypeShort
 
@@ -368,14 +387,7 @@ def materialize_same_block_register_projection_8616(
                 failure_count=1,
             ),
         )
-    source = (
-        lhs
-        if candidate.use_stored_value or any(
-            isinstance(child, CFunctionCall)
-            for child in builtins.iter(_iter_c_nodes_deep_8616(rhs))
-        )
-        else rhs
-    )
+    source = lhs if _projection_reads_stored_value_8616(candidate) else rhs
     if not isinstance(source, CExpression):
         return SameBlockRegisterProjectionResult8616(
             None,
@@ -542,10 +554,7 @@ def _reaching_lane_expression_8616(
     the assignment RHS; native reaching-definition binding follows selection.
     """
     projected: object
-    from angr.analyses.decompiler.structured_codegen.c import (
-        CFunctionCall,
-        CVariable,
-    )
+    from angr.analyses.decompiler.structured_codegen.c import CVariable
     from angr.sim_variable import SimTemporaryVariable
 
     written_offset = assignment.register_offset
@@ -557,10 +566,7 @@ def _reaching_lane_expression_8616(
         return None
     rhs = assignment.rhs
     if written_offset == requested_offset and written_size == requested_size:
-        if assignment.use_stored_value or any(
-            isinstance(child, CFunctionCall)
-            for child in builtins.iter(_iter_c_nodes_deep_8616(rhs))
-        ):
+        if _projection_reads_stored_value_8616(assignment):
             return assignment.lhs
         variables = [
             node

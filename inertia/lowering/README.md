@@ -16,8 +16,21 @@ The runtime call-input consumer is still tracked as open in
 Private tests live in `tests/lowering/`; shared behavior tests live in
 `tests/integration/`. Import these owners directly.
 
-Register-version capture consumes proven definition/use identities. Each
-selected definition evaluates its RHS once into a typed local and then
+Register-version capture consumes proven definition/use identities. A typed
+SSA register carrier with no defining assignment is captured at function entry
+when a reachable path can overwrite the architectural lane before a use of
+that version. Writes in mutually exclusive arms do not dirty one another's
+reads unless a real control transfer connects them. Lexical order alone is not
+evidence.
+The local preserves the unsigned arithmetic of the runtime lane projection.
+An operand read before its assignment's store alone does not require capture.
+Snapshot stores affect only local storage and cannot trigger another snapshot
+on a later pass. GP snapshots follow an existing first entry-SP initializer so
+its ordering remains authenticated. A bare loop body keeps its original root
+unless a snapshot needs to be inserted before it.
+`test_gp_register_entry_versions.py` covers these entry cases.
+
+Each selected definition evaluates its RHS once into a typed local and then
 publishes that local to the original architectural register. Dependent RHSs
 see prior captures before pointer-to-offset projection. Preparing N captures
 visits their individual RHSs and uses one full-function replacement walk;

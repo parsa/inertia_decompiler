@@ -26,7 +26,11 @@ from inertia.frontend.x86_16.frontend_boundary_transport import (
     restore_function_boundary_8616,
 )
 from inertia.frontend.x86_16.frontend_function_boundary import ExactFunctionRangeBoundary8616
-from inertia.frontend.x86_16.frontend_instruction_reachability import ConditionalDosExit8616, ConditionalIndirectEdge8616
+from inertia.frontend.x86_16.frontend_instruction_reachability import (
+    ConditionalDosExit8616,
+    ConditionalIndirectEdge8616,
+    ConditionalRelativeEdge8616,
+)
 from inertia.frontend.x86_16.function_knowledge_base import function_knowledge_base_8616
 from inertia.ir.analysis.alias import storage_of
 from inertia.ir.analysis.stack_frame_ir import build_x86_16_ir_frame_access_artifact
@@ -78,6 +82,8 @@ from .entry_jump_domain import (
 )
 from .function_condition_artifact import build_ir_function_condition_artifact_8616
 from .function_ir_registry import (
+    FunctionIRArtifactFailure8616,
+    FunctionIRArtifactResolution8616,
     FunctionIRArtifactVerdict8616,
     publish_function_ir_artifact_8616,
     registered_function_ir_artifact_8616,
@@ -585,15 +591,17 @@ def _function_graph_successors(
     function: object,
     block_addrs: object,
 ) -> object:
-    """Read exact Frontend or recovered angr in-function CFG edges."""
+    """Read in-function CFG edges, omitting relative inventory-only edges."""
     addresses: object
     edge: object
     source: object
     target: object
     if isinstance(function, ExactFunctionRangeBoundary8616):
+        provisional = {(edge.block_addr, edge.target_addr) for edge in iter(function.conditional_edges)
+                       if isinstance(edge, ConditionalRelativeEdge8616)}
         exact_successors: dict[cython.longlong, set[cython.longlong]] = {address: set() for address in iter(block_addrs)}
         for source, target in function.successor_edges:
-            if source in block_addrs and target in block_addrs:
+            if (source, target) not in provisional and source in block_addrs and target in block_addrs:
                 exact_successors[source].add(target)
         return {
             address: tuple(sorted(targets))
@@ -1362,9 +1370,12 @@ def _block_to_ir(
     *,
     return_terminal: cython.bint = False,
     indirect_terminal_pending: cython.bint = False,
+    function_successors: tuple[int, ...] = (),
 ) -> tuple[IRBlock, VexConditionTransportStats8616, TerminalJumpEvidence8616 | None]:
     """Import one angr block boundary into a typed IR block.
 
+    ``function_successors`` contains the independently recovered in-body CFG
+    edges; VEX alone cannot prove that an immediate far jump is in-bound.
     ``indirect_terminal_pending`` retains a discovery-only target expression.
     It grants neither a successor nor a return claim; the explicit refusal
     prevents this partial surface from becoming universal evidence.
@@ -1425,6 +1436,7 @@ def _block_to_ir(
         instruction_size=instruction_size,
         tmp_exprs=tmp_exprs,
         type_environment=type_environment,
+        function_successors=function_successors,
     )
     refusals.extend(terminal_jump.refusals)
     terminal = terminal_control_flow_instr_8616(
@@ -1788,13 +1800,15 @@ def _lift_x86_16_function_surface_8616(
             proven_return_block_addrs = (
                 function.near_return_continuations.proven_block_addrs
             )
+    function_block_addrs = _function_block_addrs(function)
+    graph_successors = _function_graph_successors(function, frozenset(function_block_addrs))
     project_boundary = cast(_ProjectBoundary, project)
     with (
         status_flag_native_source_scope_8616(project, function_addr),
         isolated_condition_lift_session_8616() as condition_capture,
         collect_accesses_for_function(function_addr) as captured,
     ):
-        for block_addr in _function_block_addrs(function):
+        for block_addr in function_block_addrs:
             if direct_evidence_deadline_expired_8616(project):
                 break
             block_addr_int = _external_int(block_addr)
@@ -1821,6 +1835,7 @@ def _lift_x86_16_function_surface_8616(
                 block,
                 return_terminal=block_addr_int in proven_return_block_addrs,
                 indirect_terminal_pending=block_addr_int in pending_indirect_blocks,
+                function_successors=() if graph_successors is None else graph_successors[block_addr_int],
             )
             if terminal_evidence is not None:
                 terminal_evidence_by_block[block_addr_int] = terminal_evidence
@@ -1834,17 +1849,14 @@ def _lift_x86_16_function_surface_8616(
             )
             transport_reports.append(transport_report)
             refusals.extend(ir_block.refusals)
-    graph_successors = _function_graph_successors(
-        function,
-        frozenset(block.addr for block in iter(blocks)),
-    )
     if graph_successors is not None:
+        lifted_addrs = frozenset(block.addr for block in iter(blocks))
         blocks = [
             IRBlock(
                 addr=block.addr,
                 instrs=block.instrs,
                 refusals=block.refusals,
-                successor_addrs=graph_successors[block.addr],
+                successor_addrs=tuple(addr for addr in graph_successors[block.addr] if addr in lifted_addrs),
             )
             for block in iter(blocks)
         ]
@@ -2421,6 +2433,28 @@ def _deadline_refused_ir_import_8616(surface: _X86_16ImportedSurface8616) -> IRF
             surface.function_addr,
         ),),
     )
+
+
+@cython.ccall
+def republish_normalized_x86_16_function_ir_8616(
+    project: object, function_addr: cython.longlong, function: object,
+) -> FunctionIRArtifactResolution8616:
+    """Rebuild stale raw IR from the current frontend boundary after normalization.
+
+    This is a producer handoff: never relabel the old artifact or recover from
+    an unrelated registry refusal. An unavailable boundary stays refused.
+    """
+    resolution = registered_function_ir_artifact_8616(project, function_addr)
+    if resolution.failure is not FunctionIRArtifactFailure8616.SOURCE_REVISION_CHANGED:
+        return resolution
+    witness = capture_function_boundary_8616(project, function)
+    if witness is None:
+        return resolution
+    boundary = restore_function_boundary_8616(project, witness)
+    if boundary is None or boundary.addr != function_addr:
+        return resolution
+    artifact = build_x86_16_ir_function_artifact(project, boundary)
+    return publish_function_ir_artifact_8616(project, artifact)
 
 
 @cython.ccall

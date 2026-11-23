@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from enum import StrEnum as StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 from typing import TypedDict as TypedDict
@@ -233,6 +234,7 @@ from inertia.ir.native_import_surface_cache import native_import_request_8616 as
 from inertia.ir.status_flag_lift_context import (
     active_status_flag_lift_context_8616 as active_status_flag_lift_context_8616,
 )
+from inertia.ir.vex_import import republish_normalized_x86_16_function_ir_8616
 from inertia.lowering.analysis_helpers import (
     sanitize_direct_call_sites_8616 as sanitize_direct_call_sites_8616,
 )
@@ -360,6 +362,9 @@ from inertia.pipeline.architecture_guard import (
 )
 from inertia.pipeline.contracts import assert_pipeline_contracts_8616 as assert_pipeline_contracts_8616
 from inertia.pipeline.errors import PipelineHardError
+from inertia.pipeline.function_readiness import (
+    produce_function_rewrite_continuation_8616 as produce_function_rewrite_continuation_8616,
+)
 from inertia.pipeline.recovery_coverage_guard import (
     assert_exact_instruction_coverage_8616 as assert_exact_instruction_coverage_8616,
 )
@@ -2499,42 +2504,6 @@ def _finalize_regenerated_noncall_ast_8616(codegen: object) -> cython.bint:
 
 
 @cython.ccall
-def _republish_rewrite_evidence_after_regen_8616(codegen: object) -> None:
-    """Republish the Rewrite output version after regen replay lanes ran.
-
-    Emission-time regeneration replays producer-owned lowering effects onto the
-    live AST. When the AST actually changed, the prior Rewrite publication no
-    longer describes the current output; re-record the real final version so
-    the emission contract observes the produced output, not a stale snapshot.
-    """
-    cfunc: object
-    function_addr: object
-    project: object
-    # Dynamic third-party angr/codegen boundary.
-    project = getattr(codegen, "project", None)
-    cfunc = getattr(codegen, "cfunc", None)
-    function_addr = getattr(cfunc, "addr", None)
-    if project is None or not isinstance(function_addr, int):
-        return
-    from inertia.ir.function_readiness_contracts import FunctionLifecycleStage8616
-    from inertia.pipeline.function_readiness import (
-        function_stage_evidence_map_8616,
-        record_function_rewrite_completion_8616,
-    )
-
-    if function_stage_evidence_map_8616(project, function_addr).get(
-        FunctionLifecycleStage8616.REWRITE
-    ) is None:
-        return
-    record_function_rewrite_completion_8616(
-        project,
-        function_addr,
-        codegen,
-        producer="x86_16_emission_regen",
-    )
-
-
-@cython.ccall
 def _regenerate_codegen_text_safely(codegen: object, *, context: object) -> object:
     """Render the live C AST while preserving evidence-backed semantic materialization."""
     if bool(getattr(codegen, "_inertia_legacy_cli_rewrite_refused_large_validated_ast", False)):
@@ -2543,10 +2512,7 @@ def _regenerate_codegen_text_safely(codegen: object, *, context: object) -> obje
         live_codegen = typing.cast(typing.Any, codegen)
         require_codegen_render_integrity_8616(codegen, context=context)
         return _normalize_text_payload_8616(live_codegen.render_text(live_codegen.cfunc)), True
-    try:
-        return _regenerate_codegen_text_safely_impl(codegen, context=context)
-    finally:
-        _republish_rewrite_evidence_after_regen_8616(codegen)
+    return _regenerate_codegen_text_safely_impl(codegen, context=context)
 
 
 @cython.ccall
@@ -2570,6 +2536,8 @@ def _regenerate_codegen_text_safely_impl(codegen: object, *, context: object) ->
         rendered_text = ctx.render_text_or_none("regen-render-text-after-regen")
         if rendered_text is not None:
             return rendered_text, False
+    except PipelineHardError:
+        raise
     except Exception as ex:
         ctx.log.warning("render_text after successful regeneration failed for %s: %s", context, ex)
     ctx.trace_dump("regen-snapshot-after-regen", _snapshot_codegen_text(codegen))
@@ -3051,6 +3019,8 @@ class _RegenRunCtx8616:
             rendered_text = self.render_text_or_none("regen-render-text-after-recursionerror")
             if rendered_text is not None:
                 return rendered_text, False
+        except PipelineHardError:
+            raise
         except Exception as ex2:
             self.log.warning("render_text after RecursionError also failed for %s: %s", self.context, ex2)
         return self.fallback_text, False
@@ -3064,6 +3034,8 @@ class _RegenRunCtx8616:
             rendered_text = self.render_text_or_none("regen-render-text-after-failed-regen")
             if rendered_text is not None:
                 return rendered_text, False
+        except PipelineHardError:
+            raise
         except Exception as ex2:
             self.log.debug("render_text after failed regeneration also failed for %s: %s", self.context, ex2)
         return self.fallback_text, False
@@ -4723,18 +4695,22 @@ class _DecompileRun8616:
             self.phase_guards_8616,
             self.phase_decompiler_run_8616,
             self.phase_no_postprocess_lane_8616,
-            self.phase_postprocess_setup_8616,
-            self.phase_rewrite_registry_8616,
-            self.phase_rewrite_dispatch_8616,
         ))
         if result is not None:
             return result
-        result = self._run_phases_8616((
+        result = self._run_cli_ast_phases_8616((
+            self.phase_postprocess_setup_8616,
+            self.phase_rewrite_registry_8616,
+            self.phase_rewrite_dispatch_8616,
             self.phase_rewrite_loop_8616,
             self.phase_callsite_guard_8616,
             self.phase_late_lowering_8616,
             self.phase_cleanup_finalize_8616,
             self.phase_render_refresh_8616,
+        ))
+        if result is not None:
+            return result
+        result = self._run_phases_8616((
             self.phase_emit_retry_8616,
             self.phase_text_normalize_8616,
             self.phase_final_cleanup_8616,
@@ -4744,6 +4720,31 @@ class _DecompileRun8616:
         result = self.phase_finish_8616()
         assert result is not None
         return result
+
+    @cython.ccall
+    def _run_cli_ast_phases_8616(self, phases: tuple[Callable[[], object], ...]) -> object:
+        """Produce one checked CLI AST before retry, text-only formatting, and final consumption."""
+        early_exit: list[object] = []
+        produce_function_rewrite_continuation_8616(
+            self.project,
+            function_original_addr(self.function),
+            self.dec.codegen,
+            producer="x86_16_cli_ast_phases",
+            mutate=partial(self._apply_cli_ast_phases_8616, phases, early_exit),
+            validate=self._validate_cli_ast_output_8616,
+        )
+        return early_exit[0] if early_exit else None
+
+    @cython.ccall
+    def _apply_cli_ast_phases_8616(
+        self, phases: tuple[Callable[[], object], ...], early_exit: list[object],
+    ) -> bool | None:
+        """Only a completed phase range is eligible for validation and publication."""
+        result = self._run_phases_8616(phases)
+        if result is not None:
+            early_exit.append(result)
+            return None
+        return True
 
     @cython.ccall
     def _run_phases_8616(
@@ -5296,21 +5297,7 @@ class _DecompileRun8616:
     def phase_no_postprocess_lane_8616(self) -> object:
         """Phase of ``_decompile_function`` spanning original lines 4202-4360."""
         if not self.enable_postprocess:
-            self._nonpost_arch_facts_8616()
-            self._remember_tail_validation_snapshot(self.dec.codegen)
-            self.rendered_text, self._ = _regenerate_codegen_text_safely(
-                self.dec.codegen,
-                context=f"{hex(self.function.addr)} {self.function.name} (non-optimized)",
-            )
-            self.formatted = _format_minimal_codegen_output(
-                self.project,
-                self.function,
-                self.rendered_text,
-                self.api_style,
-                self.binary_path,
-                self.effective_cod_metadata,
-            )
-            self._nonpost_call_arity_replay_8616()
+            self._run_cli_ast_phases_8616((self._prepare_nonpost_output_8616,))
             self.formatted = _normalize_unary_not_shift_precedence_text(self.formatted)
             _emit_c_stage_trace(
                 self.project,
@@ -5333,6 +5320,26 @@ class _DecompileRun8616:
             typing.cast(typing.Any, self.project)._inertia_partial_codegen_text = None
             return "ok", self.formatted
         return None
+
+    @cython.ccall
+    def _prepare_nonpost_output_8616(self) -> None:
+        """Prepare the non-optimized AST and candidate text before its final gate."""
+        self._nonpost_arch_facts_8616()
+        self._remember_tail_validation_snapshot(self.dec.codegen)
+        self.rendered_text, self._ = _regenerate_codegen_text_safely(
+            self.dec.codegen,
+            context=f"{hex(self.function.addr)} {self.function.name} (non-optimized)",
+        )
+        self.formatted = _format_minimal_codegen_output(
+            self.project,
+            self.function,
+            self.rendered_text,
+            self.api_style,
+            self.binary_path,
+            self.effective_cod_metadata,
+        )
+        self._nonpost_call_arity_replay_8616()
+
     @cython.ccall
     def _nonpost_arch_facts_8616(self) -> None:
         """Transfer semantic alias facts and record stack/stats state for the non-postprocess lane."""
@@ -5719,6 +5726,8 @@ class _DecompileRun8616:
             self._debug_cli_stage_marker_8616("after-live-rehydrate")
             if isinstance(self._rehydrated, str) and self._rehydrated.strip():
                 typing.cast(typing.Any, self.project)._inertia_partial_codegen_text = self._rehydrated
+        except PipelineHardError:
+            raise
         except Exception as ex:
             logging.getLogger(__name__).debug("live call rehydration skipped: %s", ex)
         with span(
@@ -5779,20 +5788,7 @@ class _DecompileRun8616:
             typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
             typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
             self._live_snapshot = ""
-        self.direct_stack_instruction_result = run_direct_instruction_materialization_8616(
-            self.project,
-            self.dec.codegen,
-            function=self.function,
-            include_direct_stack_mov=not self.pointer_memory_contract_active,
-            include_direct_global_incdec=False,
-        )
-        if self.direct_stack_instruction_result.direct_stack_mov_changed:
-            self.changed = True
-            typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
-            typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
-            self._live_snapshot = ""
-            if self._run_dead_local_prune_with_call_guard("direct-stack materialization prune removed call expressions"):
-                self._live_snapshot = ""
+        self._materialize_direct_stack_and_prune_8616()
         self.direct_global_instruction_result = run_direct_instruction_materialization_8616(
             self.project,
             self.dec.codegen,
@@ -6243,27 +6239,7 @@ class _DecompileRun8616:
             isinstance(self.final_stack_stats, dict)
             and int(self.final_stack_stats.get("raw_fact_count", 0) or 0) > 0
         ):
-            self.bounded_stack_result = run_direct_instruction_materialization_8616(
-                self.project,
-                self.dec.codegen,
-                function=self.function,
-                include_direct_stack_incdec=False,
-                include_direct_global_incdec=False,
-                source_kinds=frozenset(
-                    {
-                        DirectStackMoveSourceKind8616.SEGMENTED_MEMORY,
-                        DirectStackMoveSourceKind8616.STACK_SLOT,
-                    }
-                ),
-                materialize_stack_reloads=False,
-                include_callee_saved_spill_prune=False,
-                enforce_direct_stack_branch_contract=True,
-            )
-            if self.bounded_stack_result.changed:
-                self.changed = True
-                typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
-                typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
-                self._run_dead_local_prune_with_call_guard("bounded direct-stack materialization prune removed call expressions")
+            self._materialize_bounded_stack_and_prune_8616()
         if _replay_final_codegen_projections_after_regen_8616(self.dec.codegen):
             self.changed = True
             typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
@@ -6276,38 +6252,12 @@ class _DecompileRun8616:
         self.postprocess_already_lowered_stack_moves = bool(getattr(self.dec.codegen, "_inertia_postprocess_changed", False))
         self.final_direct_instruction_result = None
         if not self.postprocess_already_lowered_stack_moves and not self.pointer_memory_contract_active:
-            self.final_direct_instruction_result = run_direct_instruction_materialization_8616(
-                self.project,
-                self.dec.codegen,
-                function=self.function,
-                include_direct_global_incdec=False,
-                source_kinds=frozenset(
-                    {
-                        DirectStackMoveSourceKind8616.IMMEDIATE,
-                        DirectStackMoveSourceKind8616.STACK_SLOT,
-                        DirectStackMoveSourceKind8616.STACK_SLOT_EXPR,
-                        DirectStackMoveSourceKind8616.SIGNED_IDIV_REMAINDER,
-                        DirectStackMoveSourceKind8616.WIDE_CALL_RETURN_STACK_ARITH,
-                    }
-                ),
-            )
-        if self.final_direct_instruction_result is not None and self.final_direct_instruction_result.direct_stack_mov_changed:
+            self._materialize_final_stack_and_prune_8616()
+        if self._prune_dead_locals_with_call_guard("late pre-cleanup dead-local prune removed call expressions"):
             self.changed = True
             typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
             typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
-            self._run_dead_local_prune_with_call_guard("final direct-stack materialization prune removed call expressions")
-        if self._run_dead_local_prune_with_call_guard("late pre-cleanup dead-local prune removed call expressions"):
-            self.changed = True
-            typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
-            typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
-        self.late_ast_cleanup_result = finalize_late_ast_cleanup_8616(self.project, self.dec.codegen)
-        if self.late_ast_cleanup_result.changed:
-            self.changed = True
-        if self.late_ast_cleanup_result.requires_dce_after_cleanup:
-            if self._run_dead_local_prune_with_call_guard("late AST cleanup prune removed call expressions"):
-                typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
-                typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
-            self.changed = True
+        self._finalize_late_ast_cleanup_and_prune_8616()
         self.stack_probe_fact_stats = format_stack_probe_fact_stats_8616(self.dec.codegen)
         if self.stack_probe_fact_stats is not None:
             logging.getLogger(__name__).debug(
@@ -7503,7 +7453,91 @@ class _DecompileRun8616:
         )
 
     @cython.ccall
-    def _run_dead_local_prune_with_call_guard(self, error_message: object) -> cython.bint:
+    def _materialize_direct_stack_and_prune_8616(self) -> None:
+        """Materialize direct-stack effects before their dependent call-guarded prune."""
+        self.direct_stack_instruction_result = run_direct_instruction_materialization_8616(
+            self.project,
+            self.dec.codegen,
+            function=self.function,
+            include_direct_stack_mov=not self.pointer_memory_contract_active,
+            include_direct_global_incdec=False,
+        )
+        if self.direct_stack_instruction_result.direct_stack_mov_changed:
+            self.changed = True
+            typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
+            typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
+            self._live_snapshot = ""
+            self._prune_dead_locals_with_call_guard("direct-stack materialization prune removed call expressions")
+
+    @cython.ccall
+    def _materialize_bounded_stack_and_prune_8616(self) -> None:
+        """Apply bounded direct-stack effects and run the dependent prune in the same Rewrite."""
+        self.bounded_stack_result = run_direct_instruction_materialization_8616(
+            self.project,
+            self.dec.codegen,
+            function=self.function,
+            include_direct_stack_incdec=False,
+            include_direct_global_incdec=False,
+            source_kinds=frozenset(
+                {
+                    DirectStackMoveSourceKind8616.SEGMENTED_MEMORY,
+                    DirectStackMoveSourceKind8616.STACK_SLOT,
+                }
+            ),
+            materialize_stack_reloads=False,
+            include_callee_saved_spill_prune=False,
+            enforce_direct_stack_branch_contract=True,
+        )
+        if self.bounded_stack_result.changed:
+            self.changed = True
+            typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
+            typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
+            self._prune_dead_locals_with_call_guard("bounded direct-stack materialization prune removed call expressions")
+
+    @cython.ccall
+    def _materialize_final_stack_and_prune_8616(self) -> None:
+        """Apply final direct-stack effects and their dependent prune as one Rewrite."""
+        self.final_direct_instruction_result = run_direct_instruction_materialization_8616(
+            self.project,
+            self.dec.codegen,
+            function=self.function,
+            include_direct_global_incdec=False,
+            source_kinds=frozenset(
+                {
+                    DirectStackMoveSourceKind8616.IMMEDIATE,
+                    DirectStackMoveSourceKind8616.STACK_SLOT,
+                    DirectStackMoveSourceKind8616.STACK_SLOT_EXPR,
+                    DirectStackMoveSourceKind8616.SIGNED_IDIV_REMAINDER,
+                    DirectStackMoveSourceKind8616.WIDE_CALL_RETURN_STACK_ARITH,
+                }
+            ),
+        )
+        if self.final_direct_instruction_result is not None and self.final_direct_instruction_result.direct_stack_mov_changed:
+            self.changed = True
+            typing.cast(typing.Any, self.dec.codegen)._inertia_codegen_decl_refresh_required_8616 = True
+            typing.cast(typing.Any, self.dec.codegen)._inertia_force_codegen_regeneration_8616 = True
+            self._prune_dead_locals_with_call_guard("final direct-stack materialization prune removed call expressions")
+
+    @cython.ccall
+    def _finalize_late_ast_cleanup_and_prune_8616(self) -> None:
+        """Keep late AST cleanup and the prune exposed by temporary folding in one Rewrite."""
+        self.late_ast_cleanup_result = finalize_late_ast_cleanup_8616(self.project, self.dec.codegen)
+        if self.late_ast_cleanup_result.changed:
+            self.changed = True
+        if self.late_ast_cleanup_result.requires_dce_after_cleanup:
+            self._prune_dead_locals_with_call_guard("late AST cleanup prune removed call expressions")
+            self.changed = True
+
+    @cython.ccall
+    def _validate_cli_ast_output_8616(self) -> cython.bint:
+        """Check final semantic contracts on the pending Rewrite AST."""
+        return bool(refresh_x86_16_final_semantic_validation_8616(
+            self.project, self.dec.codegen, persist_failures=False, include_virtual_carriers=True,
+        ).passed)
+
+    @cython.ccall
+    def _prune_dead_locals_with_call_guard(self, error_message: object) -> cython.bint:
+        """Retain the effect-checked prune, call-loss guard, and declaration refresh."""
         before_prune_calls = self._codegen_call_expr_count() if self.call_loss_guard_active else 0
         prune_changed = _prune_dead_local_assignments(self.dec.codegen)
         if not prune_changed:
@@ -8675,16 +8709,19 @@ def _prepare_function_for_decompilation(
     function: Any,
     cod_metadata: CODProcMetadata | None = None,
 ) -> cython.longlong:
-
+    """Finalize frontend geometry before handing the function to native analysis."""
     display_addr = function_original_addr(function)
     _attach_project_context_to_function_8616(project, function)
     _emit_start_debug_8616(function, display_addr)
     sys.stdout.flush()
     typing.cast(typing.Any, project)._inertia_current_function_debug = {"addr": display_addr, "slice_addr": function.addr, "name": function.name}
     typing.cast(typing.Any, project)._inertia_current_decompile_function_8616 = function
+    needs_normalization = not function.normalized
     _maybe_normalize_function_8616(project, function)
     sanitize_direct_call_sites_8616(function)
     created_helper_stubs = _register_direct_call_target_function_stubs(project, function, cod_metadata=cod_metadata)
+    if needs_normalization and function.normalized and project.arch.name == "86_16":
+        republish_normalized_x86_16_function_ir_8616(project, function.addr, function)
     if created_helper_stubs:
         print(
             f"[dbg] registered {created_helper_stubs} direct callee stub(s) for {function.addr:#x}",

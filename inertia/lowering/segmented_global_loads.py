@@ -254,6 +254,12 @@ class CapstoneInstructionView8616:
     operands: object
 
 
+class _FunctionBlockEntriesBoundary8616(typing.Protocol):
+    """CFG block entries exposed by the third-party angr Function."""
+
+    block_addrs_set: Iterable[int]
+
+
 class _CapstoneMemoryBoundary8616(typing.Protocol):
     """Dynamic fields exposed by a third-party Capstone memory operand."""
 
@@ -12775,6 +12781,10 @@ def _recover_direct_segmented_global_store_evidence_uncached_8616(
     if project is None or function is None:
         return ()
     recovered: dict[tuple[cython.longlong, cython.longlong, MemSpace, cython.longlong], DirectSegmentedGlobalStoreEvidence8616] = {}
+    try:
+        block_entries = frozenset(cast(_FunctionBlockEntriesBoundary8616, function).block_addrs_set)
+    except AttributeError:
+        block_entries = frozenset()
     for block in _direct_global_update_blocks_8616(project, function):
         instructions = tuple(
             _capstone_instruction_view_8616(wrapper)
@@ -12794,6 +12804,7 @@ def _recover_direct_segmented_global_store_evidence_uncached_8616(
                 recovered[(evidence.offset, evidence.width, evidence.space, evidence.ins_addr)] = evidence
         for item in recover_register_constant_segmented_stores_8616(
             instructions,
+            block_entries=block_entries,
             register_name=_direct_stack_move_register_name_8616,
             segment_name=_direct_stack_move_segment_name_8616,
         ):

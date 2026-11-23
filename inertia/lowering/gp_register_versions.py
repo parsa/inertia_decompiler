@@ -1,5 +1,5 @@
 # cython: language_level=3, infer_types=True
-"""Preserve defined register values while publishing architectural writes.
+"""Preserve incoming and defined register values across architectural writes.
 
 Layer: Types/Lowering.
 Responsibility: retain exact C register identities before mutable runtime-state
@@ -21,6 +21,7 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CAssignment,
     CDirtyExpression,
     CExpression,
+    CStatement,
     CWhileLoop,
     CStatements,
     CVariable,
@@ -36,6 +37,7 @@ from inertia.lowering.c_ast_utils import (
 )
 from inertia.pipeline.errors import PipelineHardError
 
+from .gp_register_entry_flow import build_gp_entry_flow_8616
 from .stack_value_projection import project_pointer_storage_value_8616
 from .terminal_return_expressions import contains_effectful_call_8616
 import dataclasses
@@ -95,11 +97,11 @@ class GPVersionCaptureStats8616:
 
 @dataclasses.dataclass(frozen=True, )
 class _CapturePlan8616:
-    """One uniquely defined version and its dominating statement group."""
+    """One exact version and, for a defined version, its dominating statement group."""
 
     identity: RegisterIdentity8616
-    assignment: CAssignment
-    group: CStatements
+    assignment: CAssignment | None
+    group: CStatements | None
     source: CVariable | CDirtyExpression
 
 
@@ -291,10 +293,15 @@ def _may_overwrite_lane(statement: object, parent: object, classify: RegisterCla
     destination: object
     node: object
     for node in _iter_c_nodes_deep_8616(statement):
-        if isinstance(node, CAssignment):
-            destination = classify(node.lhs)
-            if destination is None or operator.eq(destination[1], parent):
-                return True
+        if not isinstance(node, CAssignment):
+            continue
+        # Captures themselves write immutable locals, not architectural lanes.
+        if (node.tags.get(_CAPTURE_TAG) is True
+                and isinstance(node.lhs, CVariable) and isinstance(node.lhs.variable, SimTemporaryVariable)):
+            continue
+        destination = classify(node.lhs)
+        if destination is None or operator.eq(destination[1], parent):
+            return True
     return False
 
 
@@ -310,17 +317,23 @@ def _outlives_register_value(
     """
     position: object
     source: object
-    statement: object
     source = scan.classify(assignment.lhs)
     assert source is not None
     linear = _linear_sequence(scope)
     position = next(index for index, node in builtins.iter(enumerate(linear)) if node is assignment)
+    return _reads_after_overwrite_8616(scan, linear[position + 1:], identity, source[1])
+
+
+def _reads_after_overwrite_8616(
+    scan: _CaptureScan8616, statements: tuple[object, ...], identity: RegisterIdentity8616, parent: str,
+) -> bool:
+    """Find stale reads, respecting RHS-before-store order for plain assignments."""
     clobbered = False
-    for statement in linear[position + 1:]:
+    for statement in statements:
         clobbered |= scan.clobbers(statement)
-        overwrite = scan.overwrites(statement, source[1])
+        overwrite = scan.overwrites(statement, parent)
         nested_overwrite = overwrite and not isinstance(statement, CAssignment)
-        if scan.statement_reads(statement, identity) and (clobbered or nested_overwrite):
+        if (clobbered or nested_overwrite) and scan.statement_reads(statement, identity):
             return True
         clobbered |= overwrite
     return False
@@ -346,29 +359,82 @@ def _linear_sequence(root: object) -> tuple[object, ...]:
     return (root,)
 
 
+def _first_entry_sp_capture_8616(root: CStatement) -> CAssignment | None:
+    """Find the SP owner's first initializer without treating other stores as captures."""
+    # The SP owner imports this backend's runtime GP projection.
+    from .entry_stack_pointer_capture import is_entry_stack_pointer_capture_8616
+
+    if isinstance(root, CStatements) and root.statements:
+        first = root.statements[0]
+        if isinstance(first, CAssignment) and is_entry_stack_pointer_capture_8616(first):
+            return first
+    return None
+
+
+def _entry_capture_plans_8616(
+    scan: _CaptureScan8616, candidates: dict[RegisterIdentity8616, tuple[CVariable, str]],
+    definitions: dict[RegisterIdentity8616, list[CAssignment]],
+) -> list[_CapturePlan8616]:
+    """Plan snapshots of upward-exposed versions only when observed after a write."""
+    root = scan.root
+    upward_exposed = {identity: value for identity, value in candidates.items() if identity not in definitions}
+    if not isinstance(root, CStatement) or not upward_exposed:
+        return []
+    flow = build_gp_entry_flow_8616(root)
+    sp_capture = _first_entry_sp_capture_8616(root)
+    if sp_capture is not None and not (
+        isinstance(sp_capture.lhs, CVariable) and isinstance(sp_capture.lhs.variable, SimTemporaryVariable)
+    ):
+        sp_capture = None
+    plans: list[_CapturePlan8616] = []
+    for identity, (source, parent) in upward_exposed.items():
+        if flow.reads_after_write(
+            lambda node, version=identity: bool(scan.statement_reads(node, version)),
+            lambda node, lane=parent: node is not sp_capture and scan.overwrites(node, lane),
+            scan.clobbers,
+        ):
+            plans.append(_CapturePlan8616(identity, None, None, source))
+    return plans
+
+
+def _entry_version_source_8616(
+    node: object, state_names: object, classify: RegisterClassifier8616,
+) -> tuple[RegisterIdentity8616, tuple[CVariable, str]] | None:
+    """Identify an SSA-backed carrier, not an unversioned register-shaped C variable."""
+    if isinstance(node, CVariable) and node.vvar_id is not None:
+        fact = classify(node)
+        if fact is not None and fact[1] in state_names:
+            return fact[0], (node, fact[1])
+    return None
+
+
 def _plans(
     root: object, state_names: object, classify: RegisterClassifier8616,
 ) -> tuple[_CapturePlan8616, ...]:
-    """Select distinct defined versions sharing an architectural state lane."""
+    """Select defined or upward-exposed versions that outlive a runtime lane."""
     fact: object
     plan: object
     assignments: object
     identity: object
     node: object
     definitions: dict[RegisterIdentity8616, list[CAssignment]] = {}
+    entry_candidates: dict[RegisterIdentity8616, tuple[CVariable, str]] = {}
     parents: dict[RegisterIdentity8616, str] = {}
     groups: list[CStatements] = []
     for node in _iter_c_nodes_deep_8616(root):
         if isinstance(node, CStatements):
             groups.append(node)
         if not isinstance(node, CAssignment):
+            candidate = _entry_version_source_8616(node, state_names, classify)
+            if candidate is not None:
+                entry_candidates.setdefault(*candidate)
             continue
         fact = classify(node.lhs)
         if fact is not None and fact[1] in state_names:
             definitions.setdefault(fact[0], []).append(node)
             parents[fact[0]] = fact[1]
     scan = _CaptureScan8616(root, classify, tuple(groups))
-    selected: list[_CapturePlan8616] = []
+    selected = _entry_capture_plans_8616(scan, entry_candidates, definitions)
     for identity, assignments in definitions.items():
         shares_lane = any(key != identity and operator.eq(parent, parents[identity]) for key, parent in builtins.iter(parents.items()))
         if len(assignments) != 1:
@@ -384,7 +450,10 @@ def _plans(
 
 @cython.ccall
 def _capture_storage_type_8616(plan: _CapturePlan8616, codegen: _Codegen8616) -> SimType:
-    """Consume a typed C variable or the exact machine width of a dirty SSA value."""
+    """Preserve entry projection arithmetic or the defined value's owned width."""
+    if plan.assignment is None:
+        # Runtime GP reads use unsigned parent arithmetic even for word/byte views.
+        return SimTypeLong(False).with_arch(codegen.project.arch)
     if isinstance(plan.source, CVariable):
         return plan.source.variable_type
     types: dict[cython.longlong, SimType] = {
@@ -399,7 +468,7 @@ def _capture_storage_type_8616(plan: _CapturePlan8616, codegen: _Codegen8616) ->
 def capture_gp_register_versions_8616(
     codegen: object, state_names: object, classify: RegisterClassifier8616,
 ) -> cython.bint:
-    """Keep local values and publish each original register write exactly once."""
+    """Keep incoming or defined GP versions stable across architectural writes."""
     position: object
     projected: object
     plan: object
@@ -429,6 +498,7 @@ def capture_gp_register_versions_8616(
     next_id = max(used_ids, default=-1) + 1
     replacements: dict[RegisterIdentity8616, CVariable] = {}
     publications: list[tuple[_CapturePlan8616, CAssignment]] = []
+    entry_captures: list[CAssignment] = []
 
     def replace_version(node: object) -> object:
         """Project selected full identities without merging architectural lanes."""
@@ -438,9 +508,16 @@ def capture_gp_register_versions_8616(
 
     for plan in plans:
         capture_type = _capture_storage_type_8616(plan, boundary)
-        temporary = SimTemporaryVariable(next_id, plan.identity[1])
+        storage_bytes = capture_type.size // 8 if plan.assignment is None else plan.identity[1]
+        temporary = SimTemporaryVariable(next_id, storage_bytes)
         next_id += 1
         value = CVariable(temporary, variable_type=capture_type, codegen=codegen)
+        function.variables_in_use[temporary] = value
+        function.variable_manager.set_variable_type(temporary, capture_type)
+        if plan.assignment is None:
+            replacements[plan.identity] = value
+            entry_captures.append(CAssignment(value, plan.source, codegen=codegen, tags={_CAPTURE_TAG: True}))
+            continue
         # A scalar register snapshot stores guest offset bits, not a host C
         # pointer. Reuse the architectural-write owner's exact projection.
         # Earlier captures must already be visible to this RHS's type query.
@@ -459,12 +536,19 @@ def capture_gp_register_versions_8616(
         publication = CAssignment(plan.source, value, codegen=codegen, tags=dict(plan.assignment.tags))
         plan.assignment.tags[_CAPTURE_TAG] = True
         publications.append((plan, publication))
-        function.variables_in_use[temporary] = value
-        function.variable_manager.set_variable_type(temporary, capture_type)
     _replace_c_children_8616(root, replace_version)
+    if entry_captures:
+        assert isinstance(root, CStatement)
+        if isinstance(root, CStatements):
+            after_sp = int(_first_entry_sp_capture_8616(root) is not None)
+            root.statements[after_sp:after_sp] = entry_captures
+        else:
+            function.statements = CStatements([*entry_captures, root], codegen=codegen)
     for plan, publication in publications:
-        position = next(index for index, statement in builtins.iter(enumerate(plan.group.statements)) if statement is plan.assignment)
-        plan.group.statements = [*plan.group.statements[:position + 1], publication, *plan.group.statements[position + 1:]]
+        group = plan.group
+        assert group is not None
+        position = next(index for index, statement in builtins.iter(enumerate(group.statements)) if statement is plan.assignment)
+        group.statements = [*group.statements[:position + 1], publication, *group.statements[position + 1:]]
     function.refresh()
     count = existing + len(plans)
     boundary._inertia_gp_register_version_capture_stats_8616 = GPVersionCaptureStats8616(count, count, count, count, 0)

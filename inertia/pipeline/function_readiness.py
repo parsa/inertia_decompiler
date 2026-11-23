@@ -86,6 +86,7 @@ __all__ = [
     "function_stage_readiness_8616",
     "function_structuring_production_scope_8616",
     "handoff_function_ast_to_rewrite_8616",
+    "produce_function_rewrite_continuation_8616",
     "record_function_ast_stage_evidence_8616",
     "record_function_rewrite_completion_8616",
     "record_function_stage_evidence_8616",
@@ -532,14 +533,19 @@ def function_stage_evidence_map_8616(
 def _live_fingerprints_8616(
     evidence: FunctionStageEvidence8616,
     walk: _EvidenceFingerprintWalk8616 | None = None,
+    *,
+    pending_ast: cython.bint = False,
 ) -> object:
-    """Re-fingerprint recorded live outputs to catch in-place mutation."""
+    """Re-fingerprint live outputs, retaining only an admitted pending AST's old fingerprint."""
     fingerprint: object
     item: object
     state = _EvidenceFingerprintWalk8616() if walk is None else walk
     live: list[str] = []
-    for item in evidence.live_outputs:
-        fingerprint = _evidence_fingerprint_8616(item, state)
+    for index, item in enumerate(evidence.live_outputs):
+        fingerprint = (
+            evidence.outputs[index] if pending_ast and isinstance(item, StructuredASTPublication8616)
+            else _evidence_fingerprint_8616(item, state)
+        )
         if fingerprint is None:
             return None
         live.append(fingerprint)
@@ -552,12 +558,16 @@ class _StageOutputObservation8616:
 
     walk: _EvidenceFingerprintWalk8616 = field(default_factory=_EvidenceFingerprintWalk8616)
     outputs: object = field(default_factory=dict)
+    pending_rewrite: FunctionStageEvidence8616 | None = None
 
     @cython.ccall
     def observe(self, evidence: FunctionStageEvidence8616) -> object:
-        """Observe shared bodies once; retain no state for the next admission."""
+        """Observe shared bodies once, retaining an admitted Rewrite AST while it is pending."""
         if evidence.stage not in self.outputs:
-            self.outputs[evidence.stage] = _live_fingerprints_8616(evidence, self.walk)
+            if evidence is self.pending_rewrite:
+                self.outputs[evidence.stage] = _live_fingerprints_8616(evidence, self.walk, pending_ast=True)
+            else:
+                self.outputs[evidence.stage] = _live_fingerprints_8616(evidence, self.walk)
         return self.outputs[evidence.stage]
 
 
@@ -670,12 +680,15 @@ def _evaluate_function_stage_readiness_8616(
     project: object,
     function_addr: cython.longlong,
     stage: FunctionLifecycleStage8616,
+    *,
+    pending_rewrite: FunctionStageEvidence8616 | None = None,
 ) -> FunctionStageReadiness8616:
     """Evaluate one stage's readiness from recorded evidence only.
 
     STALE wins over everything: the first stage in canonical order whose
     recorded evidence is dead blocks every dependent stage. A stage with no
-    recorded evidence is UNTTRACKED — never promoted, never refused.
+    recorded evidence is UNTTRACKED — never promoted, never refused. A checked
+    continuation can recheck its bindings without consuming its pending AST.
     """
     blocked: object
     evidence: object
@@ -697,7 +710,7 @@ def _evaluate_function_stage_readiness_8616(
     bodies = (raw_resolution.artifact, ssa_resolution.artifact)
     current = _registered_bodies_source_revision_8616(project, function_addr, bodies)
     target_index = FUNCTION_LIFECYCLE_STAGES_8616.index(stage)
-    observation = _StageOutputObservation8616()
+    observation = _StageOutputObservation8616(pending_rewrite=pending_rewrite)
 
     def _input_stage_alive_8616(
         declared: FunctionStageInput8616,
@@ -1015,6 +1028,129 @@ def _commit_function_rewrite_completion_8616(scope: _FunctionProductionScope8616
     )
 
 
+@dataclasses.dataclass()
+class _RewriteContinuation8616:
+    """An exact admitted Rewrite version whose owner is producing a replacement AST."""
+
+    project: object
+    function_addr: cython.longlong
+    codegen: object
+    admitted: Mapping[FunctionLifecycleStage8616, FunctionStageEvidence8616]
+    process_id: cython.longlong
+    active: bool = True
+
+    def owns_render(self, project: object, codegen: object) -> bool:
+        """Allow internal rendering only for this live process and exact generator."""
+        if (
+            not self.active or self.process_id != getpid()
+            or self.project is not project or self.codegen is not codegen
+        ):
+            return False
+        try:
+            return cast(_RewriteFunctionCodegen8616, codegen).cfunc.addr == self.function_addr
+        except AttributeError:
+            return False
+
+
+_ACTIVE_REWRITE_CONTINUATION_8616: ContextVar[_RewriteContinuation8616 | None] = ContextVar(
+    "x86_16_active_rewrite_continuation", default=None,
+)
+
+
+def _assert_rewrite_continuation_bindings_8616(scope: _RewriteContinuation8616, *, layer: object) -> None:
+    """Recheck the admitted source and upstream evidence, not the pending AST."""
+    project = scope.project
+    function_addr = scope.function_addr
+    current = function_stage_evidence_map_8616(project, function_addr)
+    for bound_stage in FUNCTION_LIFECYCLE_STAGES_8616:
+        if current.get(bound_stage) is not scope.admitted.get(bound_stage):
+            raise PipelineHardError(
+                "Late Rewrite input was replaced", layer=layer, function_addr=function_addr,
+                details={"failure": FunctionStageFailure8616.UPSTREAM_EVIDENCE_CHANGED.value,
+                         "blocking_stage": bound_stage.value},
+            )
+    stage = FunctionLifecycleStage8616.REWRITE
+    binding = _evaluate_function_stage_readiness_8616(
+        project, function_addr, stage, pending_rewrite=scope.admitted[stage],
+    )
+    if binding.verdict is not FunctionStageVerdict8616.CURRENT:
+        _observe_function_readiness_8616(project, binding)
+        raise PipelineHardError(
+            "Late Rewrite input is no longer current", layer=layer, function_addr=function_addr,
+            details=binding.to_dict(),
+        )
+
+
+def produce_function_rewrite_continuation_8616(
+    project: object,
+    function_addr: cython.longlong,
+    codegen: object,
+    *,
+    producer: str,
+    mutate: Callable[[], bool | None],
+    validate: Callable[[], bool],
+) -> bool:
+    """Produce late Rewrite output from a checked AST and a passing semantic guard.
+
+    The mutator reports changed, unchanged, or ``None`` for an incomplete phase.
+    An incomplete or throwing producer never publishes. Only internal rendering
+    can use a pending AST; final consumption requires a successful proof and seal.
+    """
+    if not requires_function_source_observation_8616(project):
+        return bool(mutate())
+    stage = FunctionLifecycleStage8616.REWRITE
+    assert_function_ast_consumer_ready_8616(project, function_addr, stage, codegen, layer=producer)
+    admitted = function_stage_evidence_map_8616(project, function_addr)
+    previous = admitted[stage]
+    if not any(
+        isinstance(item, StructuredASTPublication8616) and item.codegen is codegen
+        for item in previous.live_outputs
+    ):
+        raise PipelineHardError(
+            "Late Rewrite does not own the published AST", layer=producer, function_addr=function_addr,
+            details={"failure": FunctionStageFailure8616.AST_CONSUMER_CHANGED.value},
+        )
+    scope = _RewriteContinuation8616(project, function_addr, codegen, admitted, getpid())
+    token = _ACTIVE_REWRITE_CONTINUATION_8616.set(scope)
+    try:
+        changed = mutate()
+    finally:
+        scope.active = False
+        _ACTIVE_REWRITE_CONTINUATION_8616.reset(token)
+    if changed is None:
+        return False
+    _assert_rewrite_continuation_bindings_8616(scope, layer=producer)
+    if not changed:
+        assert_function_ast_consumer_ready_8616(project, function_addr, stage, codegen, layer=producer)
+        return False
+    if not validate():
+        raise PipelineHardError("Late Rewrite semantic validation failed", layer=producer, function_addr=function_addr)
+    _assert_rewrite_continuation_bindings_8616(scope, layer=producer)
+    publication = publish_structured_ast_output_8616(codegen)
+    snapshot = publication.observation.snapshot
+    fingerprint = _evidence_fingerprint_8616(publication)
+    if snapshot is None or operator.ne(snapshot.function_addr, function_addr) or fingerprint is None:
+        raise PipelineHardError(
+            "Late Rewrite output could not be published", layer=producer, function_addr=function_addr,
+            details={"failure": FunctionStageFailure8616.AST_PUBLICATION_UNAVAILABLE.value},
+        )
+    # Keep the exact admitted source and input bindings; only the AST output changed.
+    function_lifecycle_state_8616(project, function_addr).record(dataclasses.replace(
+        previous,
+        producer=producer,
+        ast_outputs=(publication,),
+        live_outputs=tuple(
+            publication if isinstance(item, StructuredASTPublication8616) else item
+            for item in previous.live_outputs
+        ),
+        outputs=tuple(
+            fingerprint if isinstance(item, StructuredASTPublication8616) else previous.outputs[index]
+            for index, item in enumerate(previous.live_outputs)
+        ),
+    ))
+    return True
+
+
 @contextmanager
 def function_rewrite_production_scope_8616(
     project: object, function_addr: cython.longlong, codegen: object,
@@ -1085,6 +1221,10 @@ def function_render_required_stage_8616(
     """
     current: object
     scope: object
+    continuation = _ACTIVE_REWRITE_CONTINUATION_8616.get()
+    if continuation is not None and continuation.owns_render(project, codegen):
+        _assert_rewrite_continuation_bindings_8616(continuation, layer="pipeline_contract:producer_internal_render")
+        return FunctionLifecycleStage8616.TYPES
     scope = _ACTIVE_FUNCTION_PRODUCTION_8616.get()
     if (
         scope is None or not scope.active or operator.ne(scope.process_id, getpid())

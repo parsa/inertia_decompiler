@@ -2164,6 +2164,7 @@ def _translate_guard_mid_8616(
     block_addr: cython.longlong,
     jcc_addr: cython.longlong,
     jcc_mnemonic: object,
+    insns: tuple[Any, ...],
     jcc_index: cython.longlong,
     cmp_insn: Any,
     reg_exprs: object,
@@ -2188,7 +2189,17 @@ def _translate_guard_mid_8616(
         if debug_jcc:
             _log.warning("[jcc-rewrite] ds reg missing block=%#x jcc=%#x", block_addr, jcc_addr)
         return None
-    test_decoded = _decode_test_jcc_guard_8616(project, codegen, cmp_insn, jcc_mnemonic, reg_exprs, ds_var)
+    # Only the adjacent producer in this branch's block can establish the
+    # operand here. Do not replay a definition across a block entry or a gap.
+    prior_insn: Any | None = None
+    if (
+        jcc_index >= 2
+        and cmp_insn.mnemonic == "test"
+        and insns[jcc_index - 1] is cmp_insn
+        and cmp_insn.address + cmp_insn.size == jcc_addr
+    ):
+        prior_insn = insns[jcc_index - 2]
+    test_decoded = _decode_test_jcc_guard_8616(project, codegen, cmp_insn, jcc_mnemonic, prior_insn, ds_var)
     if test_decoded is not None:
         if debug_jcc:
             _log.warning(
@@ -2229,7 +2240,7 @@ def _translate_cmp_jcc_guard_8616(
         cmp_insn = gate_result
         reg_exprs, ds_var = _guard_reg_exprs_and_ds_8616(project, codegen)
         mid = _translate_guard_mid_8616(
-            project, codegen, block_addr, jcc_addr, jcc_mnemonic, jcc_index,
+            project, codegen, block_addr, jcc_addr, jcc_mnemonic, insns, jcc_index,
             cmp_insn, reg_exprs, ds_var, debug_jcc,
         )
         if mid is not None:
@@ -2266,14 +2277,49 @@ def _translate_cmp_jcc_guard_8616(
     return _impl()
 
 
+def _test_operand_expr_8616(
+    project: Any, codegen: Any, operand: Any, test_insn: Any, prior_insn: Any | None, ds_var: Any
+) -> object | None:
+    """Project a register read from an adjacent stack load only when all loaded bits are represented."""
+    if int(operand.type) != 1:
+        return _resolve_cmp_operand_expr_8616(
+            project, codegen, operand, {}, ds_var, test_insn.reg_name, {}, int(test_insn.address)
+        )
+    if prior_insn is None or prior_insn.mnemonic != "mov" or prior_insn.address + prior_insn.size != test_insn.address:
+        return None
+    operands = prior_insn.operands
+    if len(operands) != 2:
+        return None
+    dst, src = operands
+    if dst.type != 1 or src.type != 3 or dst.reg != operand.reg or dst.size != operand.size or src.size != operand.size:
+        return None
+    mem = src.mem
+    if prior_insn.reg_name(mem.base) != "bp" or mem.index or (mem.segment and prior_insn.reg_name(mem.segment) != "ss"):
+        return None
+    bp_offset, size = int(mem.disp), int(src.size)
+    projected = project_stack_value_range_8616(codegen, bp_offset, size)
+    owner = projected.owner
+    if projected.expression is None or owner is None or not isinstance(owner.cvar, CVariable):
+        return None
+    # A byte-rounded range or ABI storage slot alone does not prove all loaded bits.
+    try:
+        value_bits = owner.cvar.variable_type.size
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not isinstance(value_bits, int) or value_bits < (bp_offset - owner.bp_offset + size) * 8:
+        return None
+    return projected.expression
+
+
 def _decode_test_jcc_guard_8616(
     project: Any,
     codegen: Any,
     test_insn: Any,
     jcc_mnemonic: object,
-    reg_exprs: object,
+    prior_insn: Any | None,
     ds_var: Any,
 ) -> _DecodedCmpGuard8616 | None:
+    """Decode a zero-test without treating register assignment tags as uses."""
     def _impl() -> _DecodedCmpGuard8616 | None:
         lhs: object
         rhs: object
@@ -2285,27 +2331,8 @@ def _decode_test_jcc_guard_8616(
         operands = tuple(getattr(test_insn, "operands", ()) or ())
         if len(operands) != 2:
             return None
-        reg_state: dict[str, object] = {}
-        lhs = _resolve_cmp_operand_expr_8616(
-            project,
-            codegen,
-            operands[0],
-            reg_state,
-            ds_var,
-            test_insn.reg_name,
-            reg_exprs,
-            int(test_insn.address),
-        )
-        rhs = _resolve_cmp_operand_expr_8616(
-            project,
-            codegen,
-            operands[1],
-            reg_state,
-            ds_var,
-            test_insn.reg_name,
-            reg_exprs,
-            int(test_insn.address),
-        )
+        lhs = _test_operand_expr_8616(project, codegen, operands[0], test_insn, prior_insn, ds_var)
+        rhs = _test_operand_expr_8616(project, codegen, operands[1], test_insn, prior_insn, ds_var)
         if lhs is None or rhs is None:
             return None
         if _same_c_expression_8616(lhs, rhs):

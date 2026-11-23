@@ -1,5 +1,13 @@
 # IR evidence contracts
 
+## Immediate far-jump terminals
+
+Native `EA` at the exact block tail must match both the lifted destination and
+an in-function CFG edge. Raw IR retains a `JMP` for that closed edge. Without
+that proof, import records `terminal_far_jump_unmodeled` on the block and the
+function; CS/IP writes alone do not account for execution of the destination.
+Controls: `tests/ir/test_native_immediate_far_jump.py`.
+
 ## CS-relative data addresses
 
 Explicit CS-prefixed memory accesses retain `MemSpace.CS`, including indexed
@@ -896,6 +904,17 @@ never enters the reuse pool. Controls live in
 mutation epoch is introduced.
 
 
+### Scoped immediate far CALL continuation
+
+The entry-jump solver can consume an explicitly offered declared invocation
+replayed through one exact `9A` CALL. The post-push CS:IP and SS:SP and both
+saved words must match the current relocated instruction and image. The
+callee's saved-frame proof then authorizes only CS in the private continuation
+view; it does not change the raw CALL or its far-entry CS write. Application
+replays the same scope and return proof before publishing dependent jump edges.
+No boot-to-caller reachability, unconditional return, or preservation of any
+other register is inferred. See `tests/ir/test_entry_jump_domain_far_continuation.py`.
+
 ### Retained native callees in selector induction
 
 A call-preservation record may carry authenticated raw native callee coverage
@@ -934,3 +953,27 @@ callee completeness. Changed source, receipt, scope, bytes or target geometry
 must refuse. The ordinary native and near-return routes keep their own checks.
 `tests/ir/test_selector_indirect_control_binding.py` exercises this boundary
 using a real native table-driven callee and independent corruption controls.
+
+## Native word RETF publication
+
+For an exact, unprefixed word `RETF`, native SSA may publish a frame effect
+with a proven incoming word SP. A computed SP additionally requires a current
+raw-IR-bound Alias proof for that exact return block and instruction: incoming
+BP is preserved and the SP transfer agrees with the word RETF displacement.
+The native gate binds that frame and every supported reaching register and
+FLAGS owner together before DCE. It checks SP/ESP overlap at the first
+statement of the RETF instruction, before the terminal SP write: restoring
+only SP cannot erase a surviving owner of upper ESP. A stale frame receipt,
+an unbound or conflicting owner, or a remaining partial/wider owner refuses
+the computed frame rather than publishing a partial group. Near returns, `IRET`, and
+prefixed returns do not inherit this default. Clinic tests cover both encodings,
+framed publication, and the refusal cases in `test_native_word_far_return_exit.py`.
+
+## Raw IR handoff after CFG normalization
+
+An early indexed-Alias producer may publish raw IR before the CLI normalizes
+an overlapping CFG. If normalization changes that source revision, the CLI
+preparation boundary asks the raw-IR producer to rebuild against the finalized
+frontend boundary before native analysis. The registry admits the fresh build
+through its normal source attestation checks. A consumer must still refuse a
+stale artifact; it must not rebuild, relabel, or substitute it during lookup.

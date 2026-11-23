@@ -16,11 +16,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, cast
 
+from angr import Project
+
 from inertia.frontend.x86_16.declared_function_entry import DeclaredFunctionEntryAdmission8616
+from inertia.frontend.x86_16.frontend_cfg_direct_jump import prove_near_call_relative_edge_8616
+from inertia.frontend.x86_16.frontend_direct_callsite_index import registered_decoded_callsite_index_8616
 from inertia.frontend.x86_16.frontend_function_boundary import (
     ExactFunctionRangeBoundary8616,
     exact_function_range_boundary_8616,
 )
+from inertia.frontend.x86_16.frontend_instruction_reachability import ConditionalRelativeEdge8616
+from inertia.frontend.x86_16.frontend_near_return_continuation import prove_near_call_frame_premise_8616
 from inertia.pipeline.errors import PipelineHardError
 
 from .declared_selector_call_preservation import collect_declared_selector_call_preservations_8616
@@ -34,7 +40,7 @@ from .entry_domain_call_preservation import (
     _function_entry_for_head_8616,
 )
 from .native_import_surface_cache import native_import_request_8616
-from .near_call_entry_pipeline import NativeNearCallPipeline8616
+from .near_call_entry_pipeline import NativeNearCallPipeline8616, incoming_encoded_near_call_rows_8616
 from .real16_invocation_domain import (
     DeclaredFunctionEntryLink8616,
     Real16InvocationDomain8616,
@@ -271,6 +277,7 @@ def prepare_declared_entry_pipeline_8616(
     if retained is not None:
         if retained.source is not source or retained.admission is not admission:
             raise PipelineHardError("consumed function entry declaration changed", layer="ir", function_addr=function_addr)
+        _require_retained_relative_entry_agreement_8616(retained)
         return retained
     if admission is None or source is None:
         return _prepare_pending_native_entry_8616(project, source, function_addr)
@@ -352,6 +359,81 @@ def _universal_pending_control_complete_8616(
             and not application.refusals and operator.eq(len(application.applied), len(pending)))
 
 
+def _declared_relative_candidate_8616(
+    project: object, source: Real16InvocationSource8616, entry: int,
+) -> ConditionalRelativeEdge8616 | None:
+    """Authenticate the one encoded caller against its registered project census."""
+    rows = incoming_encoded_near_call_rows_8616(source, entry)
+    if len(rows) != 1 or not isinstance(project, Project):
+        return None
+    row = rows[0]
+    caller = registered_decoded_callsite_index_8616(project, row.caller_start)
+    if caller is None or caller.boundary.project is not project:
+        return None
+    if caller.index is not source.callsite_index:
+        # A combined source index may replay a registered census, but equal
+        # coordinates or equal bytes from a foreign decode do not rebind it.
+        if not any(
+            local is census and census.entry_addr == row.caller_start and census.instructions is row.instructions
+            for local in caller.index.caller_censuses for census in source.callsite_index.caller_censuses
+        ):
+            return None
+        local_rows = tuple(item for item in caller.index.for_target(entry) if item == row)
+        if len(local_rows) != 1:
+            return None
+        row = local_rows[0]
+    premise = prove_near_call_frame_premise_8616(row, caller.index, entry)
+    return None if premise is None else prove_near_call_relative_edge_8616(project, premise)
+
+
+def _require_relative_entry_agreement_8616(
+    edge: ConditionalRelativeEdge8616,
+    boundary: ExactFunctionRangeBoundary8616,
+    entry: DeclaredEntryPipeline8616,
+) -> None:
+    """Refuse a provisional census unless the same raw terminal is applied under scope."""
+    from .entry_jump_domain import (
+        EntryJumpDomainApplicationStatus8616,
+        collect_pending_terminal_jumps_8616,
+    )
+
+    bundle, scope, view = entry.bundle, entry.scope, entry.view
+    pending = collect_pending_terminal_jumps_8616(bundle.terminal_evidence).get(edge.block_addr)
+    admitted = tuple(jump for jump in view.proof.admitted
+                     if (jump.block_addr, jump.head, jump.target) == (edge.block_addr, edge.instruction_addr, edge.target_addr))
+    application = view.application
+    link = scope.chain
+    if (
+        pending is None or not edge.matches_terminal(pending.decoded)
+        or len(boundary.conditional_edges) != 1 or boundary.conditional_edges[0] is not edge
+        or scope.project is not boundary.project or not isinstance(link, DeclaredFunctionEntryLink8616)
+        or scope.boot is not entry.source.boot or scope.boot_recompute is not entry.source.boot_recompute
+        or link.admission is not entry.admission or link.boundary is not boundary or link.artifact is not bundle.artifact
+        or view.failure is not None or view.boundary is not boundary or view.source_artifact is not bundle.artifact
+        or view.invocation_scope is not scope or len(admitted) != 1
+        or application is None or application.status is not EntryJumpDomainApplicationStatus8616.APPLIED
+        or not any(jump is admitted[0] for jump in application.applied)
+        or view.effective_successors_for(scope, edge.block_addr) != (edge.target_addr,)
+    ):
+        raise PipelineHardError(
+            "declared relative census disagrees with its scoped application", layer="ir", function_addr=boundary.addr,
+        )
+
+
+def _require_retained_relative_entry_agreement_8616(entry: DeclaredEntryInput8616) -> None:
+    """Keep provisional declared entries bound when handing them to another consumer."""
+    if isinstance(entry, NativeNearCallPipeline8616):
+        return
+    boundary = entry.view.boundary
+    for edge in boundary.conditional_edges:
+        if isinstance(edge, ConditionalRelativeEdge8616):
+            if not isinstance(entry, DeclaredEntryPipeline8616):
+                raise PipelineHardError(
+                    "declared relative census has no consuming scope", layer="ir", function_addr=boundary.addr,
+                )
+            _require_relative_entry_agreement_8616(edge, boundary, entry)
+
+
 def _prepare_native_entry_8616(
     project: object, source: Real16InvocationSource8616, admission: DeclaredFunctionEntryAdmission8616,
 ) -> DeclaredEntryInput8616:
@@ -370,7 +452,9 @@ def _prepare_native_entry_8616(
     if operator.ne((spec.entry_segment << 4) + spec.entry_offset, spec.range_start):
         raise PipelineHardError("initial pipeline requires a declared function-head entry", layer="ir",
                                 function_addr=(spec.entry_segment << 4) + spec.entry_offset)
-    boundary = exact_function_range_boundary_8616(project, spec.range_start, spec.range_end)
+    relative_edge = _declared_relative_candidate_8616(project, source, spec.range_start)
+    edges = () if relative_edge is None else (relative_edge,)
+    boundary = exact_function_range_boundary_8616(project, spec.range_start, spec.range_end, conditional_edges=edges)
     artifact = None if boundary is None else real16_native_census_import_8616(project, boundary)
     if boundary is None or artifact is None:
         raise PipelineHardError("declared entry native surface is incomplete", layer="ir", function_addr=spec.range_start)
@@ -396,6 +480,10 @@ def _prepare_native_entry_8616(
     if bundle is None:
         raise PipelineHardError("declared entry native surface changed", layer="ir", function_addr=spec.range_start)
     if scope is None:
+        if relative_edge is not None:
+            raise PipelineHardError(
+                "declared relative census has no consuming scope", layer="ir", function_addr=spec.range_start,
+            )
         # A valid declaration whose optional premise proof produced no scope
         # keeps its authenticated raw graph under a typed non-proof record;
         # the scoped view with no consuming entry carries its own refusal.
@@ -437,7 +525,10 @@ def _prepare_native_entry_8616(
                 ),
             },
         )
-    return DeclaredEntryPipeline8616(source, admission, bundle, scope, view, selector_scope)
+    entry = DeclaredEntryPipeline8616(source, admission, bundle, scope, view, selector_scope)
+    if relative_edge is not None:
+        _require_relative_entry_agreement_8616(relative_edge, boundary, entry)
+    return entry
 
 
 @cython.ccall
@@ -501,6 +592,7 @@ def retain_declared_entry_pipeline_8616(codegen: object, entry: DeclaredEntryInp
     attachment. Preparation authenticates it before semantic consumption;
     retaining the pointer neither installs IR nor authenticates native bytes.
     """
+    _require_retained_relative_entry_agreement_8616(entry)
     cast(_CodegenEntryBoundary8616, codegen)._inertia_declared_entry_pipeline_8616 = entry
 
 

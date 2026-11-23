@@ -374,15 +374,24 @@ def _update_register_constants_8616(
 def recover_register_constant_segmented_stores_8616(
     instructions: Sequence[InstructionView8616],
     *,
+    block_entries: frozenset[int],
     register_name: RegisterNameResolver8616,
     segment_name: RegisterNameResolver8616,
 ) -> tuple[RegisterConstantSegmentedStoreEvidence8616, ...]:
-    """Recover exact register-addressed segmented stores within one basic block."""
+    """Recover constants re-established within the store's basic-block visit.
+
+    A decoded window can span multiple CFG blocks. Every CFG entry, including
+    a backedge target, starts with no constant evidence from the previous block.
+    """
+    if not instructions or instructions[0].address not in block_entries:
+        return ()
     evidence: object
     instruction: object
     constants: dict[str, cython.longlong] = {}
     recovered: list[RegisterConstantSegmentedStoreEvidence8616] = []
     for instruction in instructions:
+        if instruction.address in block_entries:
+            constants.clear()
         evidence = _store_evidence_8616(
             instruction,
             constants,

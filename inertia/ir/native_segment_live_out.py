@@ -2,9 +2,10 @@
 """Preserve architectural segment outputs in native SSA reaching definitions.
 
 Layer: IR/native SSA adapter.
-Responsibility: publish segment return uses, retain stack-backed GP outputs
-until owned Alias/Lowering can discharge their segmented restore effects, and
-retain reaching register definitions at unmodeled tail exits.
+Responsibility: publish segment return uses, proven GP word exits, and word
+RETF effects with proven incoming or balanced SP; retain stack-backed GP
+outputs until Alias/Lowering can discharge their segmented restore effects,
+and retain reaching definitions at unmodeled exits.
 Owns typed Value, Address, Condition, instruction facts, and lossless normalization.
 Do not perform alias-state ownership, widening, lowering/materialization,
 structuring, rewrite, postprocess, or CLI/reporting work here.
@@ -36,15 +37,18 @@ no ABI contract for the unknown destination.
 """
 
 from __future__ import annotations
-import typing
-import cython
-import os
 
-from collections.abc import Callable, Iterator, Mapping
+import builtins
+import dataclasses
+import operator
+import os
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Protocol, cast
 
+import cython
 import networkx as nx
+from angr import Project
 from angr.ailment import Block
 from angr.ailment.block_walker import AILBlockViewer
 from angr.ailment.expression import (
@@ -60,21 +64,36 @@ from angr.ailment.expression import (
     VirtualVariable,
     VirtualVariableCategory,
 )
-from angr.ailment.statement import Assignment, ConditionalJump, Jump, Label, Return, SideEffectStatement, Statement
+from angr.ailment.statement import (
+    Assignment,
+    ConditionalJump,
+    Jump,
+    Label,
+    Return,
+    SideEffectStatement,
+    Statement,
+)
 from angr.analyses.decompiler.ail_simplifier import AILSimplifier
 from angr.analyses.decompiler.clinic import Clinic
 from angr.analyses.s_reaching_definitions.s_rda_view import SRDAView
-from angr.analyses.s_reaching_definitions.s_reaching_definitions import SReachingDefinitions
+from angr.analyses.s_reaching_definitions.s_reaching_definitions import (
+    SReachingDefinitions,
+)
 from angr.code_location import AILCodeLocation
-from angr.knowledge_plugins.key_definitions.constants import ObservationPoint, ObservationPointType
+from angr.knowledge_plugins.key_definitions.constants import (
+    ObservationPoint,
+    ObservationPointType,
+)
+
+from inertia.pipeline.errors import PipelineHardError
+from inertia.semantics.terminal_return_contract import (
+    WordFarReturnLayout8616,
+    WordInterruptReturnLayout8616,
+    WordNearReturnLayout8616,
+)
 
 from .native_stack_anchor import native_stack_anchor_8616
 from .segment_state_transfer import SEGMENT_REGISTERS
-from inertia.semantics.terminal_return_contract import WordFarReturnLayout8616, WordNearReturnLayout8616
-from inertia.semantics.terminal_return_contract import WordInterruptReturnLayout8616
-import dataclasses
-import operator
-import builtins
 
 
 @dataclasses.dataclass(frozen=True, )
@@ -467,8 +486,14 @@ def _ordered_gp_exit_definitions_8616(path, coordinates):
     return tuple(sorted(set(owners.values()), key=order.__getitem__))
 
 
-def _apply_gp_lane_writes_8616(block, coordinates, key, owners, order, incoming=None):
-    for index, stmt in enumerate(block.statements[:-1]):
+def _apply_gp_lane_writes_8616(
+    block: Block, coordinates: set[tuple[int, int]], key: tuple[int, int | None],
+    owners: dict[int, object], order: dict[NativeGPExitDefinition8616, int],
+    incoming: Mapping[tuple[int, int | None], Mapping[int, object]] | None = None,
+    *, stop_before: int | None = None,
+) -> bool:
+    """Update exact byte owners up to the terminator or a proven statement boundary."""
+    for index, stmt in enumerate(block.statements[: -1 if stop_before is None else stop_before]):
         if (isinstance(stmt, SideEffectStatement) and isinstance(stmt.expr, Call)
                 and stmt.expr.target == "inertia_architectural_gp_exit"
                 and "inertia_gp_exit_coordinate" in stmt.tags):
@@ -711,8 +736,12 @@ def _apply_native_gp_merge_after_ssa0_8616():
     Clinic._transform_to_ssa_level0 = _ssa0_with_gp_exit_merges_8616
 
 
-def _agreed_gp_exit_definitions_8616(graph, entry, exit_block, coordinates, *, exit_inputs=None):
-    """Join identical ordered byte owners; differing owners require a phi."""
+def _agreed_gp_exit_definitions_8616(
+    graph: nx.DiGraph, entry: Block, exit_block: Block, coordinates: set[tuple[int, int]], *,
+    exit_inputs: MutableMapping[tuple[int, int | None], Mapping[int, object]] | None = None,
+    exit_statement_index: int | None = None,
+) -> tuple[NativeGPExitDefinition8616, ...] | None:
+    """Join byte owners at the requested exit point; differing owners require a phi."""
     if graph.in_degree(entry):
         return None
     cone = graph.subgraph(nx.ancestors(graph, exit_block) | {exit_block})
@@ -727,7 +756,7 @@ def _agreed_gp_exit_definitions_8616(graph, entry, exit_block, coordinates, *, e
     try:
         traversal = tuple(nx.topological_sort(cone))
     except nx.NetworkXUnfeasible:
-        return _cyclic_gp_exit_definitions_8616(cone, entry, exit_block, coordinates, conflict)
+        return _cyclic_gp_exit_definitions_8616(cone, entry, exit_block, coordinates, conflict, exit_statement_index)
     for block in traversal:
         predecessors = tuple(cone.predecessors(block))
         if block is not entry and not predecessors:
@@ -745,7 +774,8 @@ def _agreed_gp_exit_definitions_8616(graph, entry, exit_block, coordinates, *, e
         incoming = {(pred.addr, pred.idx): outgoing[pred] for pred in predecessors}
         if len(incoming) != len(predecessors):
             return None
-        if not _apply_gp_lane_writes_8616(block, coordinates, key, owners, order, incoming):
+        stop_before = exit_statement_index if block is exit_block else None
+        if not _apply_gp_lane_writes_8616(block, coordinates, key, owners, order, incoming, stop_before=stop_before):
             return None
         if block is exit_block and exit_inputs is not None:
             exit_inputs.update(incoming)
@@ -756,8 +786,11 @@ def _agreed_gp_exit_definitions_8616(graph, entry, exit_block, coordinates, *, e
     return tuple(sorted(facts, key=order.__getitem__))
 
 
-def _cyclic_gp_exit_definitions_8616(cone, entry, exit_block, coordinates, conflict):
-    """Solve byte ownership on loop edges and publish only a closed solution."""
+def _cyclic_gp_exit_definitions_8616(
+    cone: nx.DiGraph, entry: Block, exit_block: Block, coordinates: set[tuple[int, int]],
+    conflict: object, exit_statement_index: int | None,
+) -> tuple[NativeGPExitDefinition8616, ...] | None:
+    """Solve byte ownership on loop edges and observe the requested exit point."""
     reachable = nx.descendants(cone, entry) | {entry}
     if len(reachable) != len(cone):
         return None
@@ -789,7 +822,10 @@ def _cyclic_gp_exit_definitions_8616(cone, entry, exit_block, coordinates, confl
             # Provisional predecessor states can seed the iteration, but
             # can never authenticate an incomplete phi.
             complete = len(known) == len(predecessors)
-            if not _apply_gp_lane_writes_8616(block, coordinates, key, owners, order, incoming if complete else None):
+            stop_before = exit_statement_index if block is exit_block else None
+            if not _apply_gp_lane_writes_8616(
+                block, coordinates, key, owners, order, incoming if complete else None, stop_before=stop_before,
+            ):
                 return None
             if block not in outgoing or outgoing[block] != owners:
                 outgoing[block] = owners
@@ -865,16 +901,20 @@ def _gp_exit_edge_observations_8616(graph, view, entry, observations, definition
 
 @dataclass(frozen=True)
 class NativeWordFarReturnInput8616:
-    """The reaching SP definition before the exact RETF instruction."""
+    """The reaching SP definition before one exact decoded word return."""
 
     site: int
     layout: WordFarReturnLayout8616 | WordNearReturnLayout8616 | WordInterruptReturnLayout8616
     definition: NativeGPExitDefinition8616
+    instruction_start: int
     incoming_operand: VirtualVariable | None = None
 
 
-def _native_word_far_return_inputs_8616(project, graph, view, entry, definitions):
-    """Observe the instruction input, separate from the terminal SP write."""
+def _native_word_far_return_inputs_8616(
+    project: Project, graph: nx.DiGraph, view: SRDAView, entry: Block | None,
+    definitions: Mapping[int, AILCodeLocation], *, far_only: bool = False,
+) -> tuple[NativeWordFarReturnInput8616, ...]:
+    """Prove the pre-instruction SP, optionally only for word RETF endpoints."""
     sites = {}
     blocks = {(block.addr, block.idx): block for block in graph}
     for block in graph:
@@ -895,9 +935,12 @@ def _native_word_far_return_inputs_8616(project, graph, view, entry, definitions
             encoding = bytes(project.loader.memory.load(site, 3)) if opcode in (b"\xca", b"\xc2") else opcode
         except (KeyError, ValueError):
             continue
-        layout = (WordFarReturnLayout8616.from_encoding(encoding)
-                  or WordNearReturnLayout8616.from_encoding(encoding)
-                  or WordInterruptReturnLayout8616.from_encoding(encoding))
+        layout: WordFarReturnLayout8616 | WordNearReturnLayout8616 | WordInterruptReturnLayout8616 | None
+        layout = WordFarReturnLayout8616.from_encoding(encoding)
+        if layout is None and not far_only:
+            layout = (
+                WordNearReturnLayout8616.from_encoding(encoding) or WordInterruptReturnLayout8616.from_encoding(encoding)
+            )
         if layout is not None:
             sites[("stmt", ((block.addr, block.idx), first), ObservationPointType.OP_BEFORE)] = (site, layout)
     if not sites:
@@ -961,19 +1004,112 @@ def _native_word_far_return_inputs_8616(project, graph, view, entry, definitions
                 continue
             bindings.append(NativeWordFarReturnInput8616(
                 site, layout, NativeGPExitDefinition8616(exit_key, offset, width, stmt.dst.varid, terminal_origin),
-                pre.copy(),
+                first, pre.copy(),
             ))
             continue
         if source is None or source.is_extern:
             continue
         bindings.append(NativeWordFarReturnInput8616(
-            site, layout, NativeGPExitDefinition8616(exit_key, offset, width, varid, source),
+            site, layout, NativeGPExitDefinition8616(exit_key, offset, width, varid, source), first,
         ))
     return tuple(bindings)
 
 
+def _native_gp_word_exit_definitions_8616(
+    graph: nx.DiGraph,
+    entry: Block | None,
+    registers: Mapping[str, tuple[int, int]],
+) -> Iterator[NativeGPExitDefinition8616]:
+    """Select complete, unambiguous BX and DX operands at native returns.
+
+    Check each family independently, including overlapping views, so a missing
+    or split word cannot publish a stale definition or clobber an incoming byte.
+    """
+    if entry is None:
+        return
+    for block in graph:
+        if graph.out_degree(block) or not block.statements or not isinstance(block.statements[-1], Return):
+            continue
+        if any(
+            not parent.statements or not isinstance(parent.statements[-1], (Jump, ConditionalJump))
+            for parent in nx.ancestors(graph, block)
+        ):
+            continue
+        for names in (("bx", "ebx", "bl", "bh"), ("dx", "edx", "dl", "dh")):
+            word = registers[names[0]]
+            views = {registers[name] for name in names}
+            owners = _agreed_gp_exit_definitions_8616(graph, entry, block, views)
+            if owners is not None and len(owners) == 1:
+                fact = owners[0]
+                if (fact.register_offset, fact.byte_width) == word:
+                    yield fact
+
+
+@dataclass(frozen=True)
+class _BalancedWordRetfUses8616:
+    """One complete and immediately bindable frame/output group."""
+
+    frame: NativeWordFarReturnInput8616
+    definitions: tuple[NativeGPExitDefinition8616, ...]
+
+
+def _balanced_word_retf_uses_8616(
+    project: Project, function: object, function_addr: int, graph: nx.DiGraph, entry: Block,
+    frames: tuple[NativeWordFarReturnInput8616, ...], registers: Mapping[str, tuple[int, int]],
+) -> tuple[_BalancedWordRetfUses8616, ...]:
+    """Join current Alias evidence to exact word-lane definitions before DCE."""
+    from inertia.alias.balanced_word_retf import (
+        WordRetfEndpoint8616,
+        prove_current_balanced_word_retf_exits_8616,
+    )
+
+    candidates = {
+        WordRetfEndpoint8616(frame.definition.exit_key[0], frame.site, frame.layout): frame
+        for frame in frames
+        if frame.incoming_operand is None and frame.definition.exit_key[1] is None
+        and isinstance(frame.layout, WordFarReturnLayout8616)
+    }
+    if not candidates:
+        return ()
+    balanced = prove_current_balanced_word_retf_exits_8616(project, function, function_addr, frozenset(candidates))
+    if not balanced:
+        return ()
+    blocks = {(block.addr, block.idx): block for block in graph}
+    words = sorted({registers[name] for name in ("ax", "bx", "cx", "dx", "bp", "flags", "si", "di")})
+    sp = registers["sp"]
+    overlapping = {
+        word: {view for view in registers.values()
+               if view[0] < word[0] + word[1] and word[0] < view[0] + view[1]}
+        for word in (*words, sp)
+    }
+    uses: list[_BalancedWordRetfUses8616] = []
+    for endpoint, frame in candidates.items():
+        if endpoint not in balanced or frame.definition.bind_operand(blocks) is None:
+            continue
+        exit_block = blocks[frame.definition.exit_key]
+        # Alias proves the low word transfer, not the upper half of ESP.
+        stack_owners = _agreed_gp_exit_definitions_8616(
+            graph, entry, exit_block, overlapping[sp], exit_statement_index=frame.instruction_start,
+        )
+        if stack_owners is None or any((fact.register_offset, fact.byte_width) != sp for fact in stack_owners):
+            continue
+        definitions: list[NativeGPExitDefinition8616] = []
+        for word in words:
+            reaching = _agreed_gp_exit_definitions_8616(graph, entry, exit_block, overlapping[word])
+            # Refuse the entire endpoint if a partial or wider owner remains.
+            if reaching is None or any(
+                (fact.register_offset, fact.byte_width) != word or fact.bind_operand(blocks) is None
+                for fact in reaching
+            ):
+                break
+            definitions.extend(reaching)
+        else:
+            uses.append(_BalancedWordRetfUses8616(frame, tuple(definitions)))
+    return tuple(uses)
+
+
 def _apply_native_gp_return_dce_guard_8616() -> None:
-    """Retain actual reaching GP writes at native return points during DCE."""
+    """Retain GP writes during DCE and bind proven word operands to exits."""
     original = AILSimplifier._remove_dead_assignments
     if original.__name__ == "_remove_dead_with_gp_returns_8616":
         return
@@ -1008,7 +1144,8 @@ def _apply_native_gp_return_dce_guard_8616() -> None:
         flags_exit = os.getenv("INERTIA_EXPERIMENTAL_FLAGS_EXIT_USE") == "1"
         if flags_exit:
             offsets.add(arch.registers["flags"][0])
-        if os.getenv("INERTIA_EXPERIMENTAL_GP_EXIT_USES") == "1":
+        experimental_gp_exit = os.getenv("INERTIA_EXPERIMENTAL_GP_EXIT_USES") == "1"
+        if experimental_gp_exit:
             observations = _gp_exit_edge_observations_8616(
                 graph, view, entry, observations, model.all_vvar_definitions,
             )
@@ -1021,46 +1158,72 @@ def _apply_native_gp_return_dce_guard_8616() -> None:
             for fact in _native_word_far_return_inputs_8616(self.project, graph, view, entry, model.all_vvar_definitions):
                 if fact.definition.bind_operand(blocks) is not None:
                     print("[word-far-return-input]", fact)
-        if os.getenv("INERTIA_EXPERIMENTAL_GP_EXIT_USES") == "1":
+        if not experimental_gp_exit:
+            facts = tuple(_native_gp_word_exit_definitions_8616(graph, entry, arch.registers))
+            retained.update(fact.variable_id for fact in facts)
+        expanded_word_returns = experimental_gp_exit and os.getenv("INERTIA_EXPERIMENTAL_WORD_FAR_RETURN") == "1"
+        return_frames = _native_word_far_return_inputs_8616(
+            self.project, graph, view, entry, model.all_vvar_definitions, far_only=not expanded_word_returns,
+        )
+        scoped_flags: set[NativeGPExitDefinition8616] = set()
+        balanced_uses: tuple[_BalancedWordRetfUses8616, ...] = ()
+        if not expanded_word_returns:
+            incoming_frames = tuple(frame for frame in return_frames if frame.incoming_operand is not None)
+            balanced_uses = (
+                _balanced_word_retf_uses_8616(self.project, self.func, self.func.addr, graph, entry, return_frames, arch.registers)
+                if not experimental_gp_exit and entry is not None else ()
+            )
+            return_frames = (*incoming_frames, *(group.frame for group in balanced_uses))
+            if balanced_uses:
+                balanced_exits = {group.frame.definition.exit_key for group in balanced_uses}
+                exact = tuple(fact for group in balanced_uses for fact in group.definitions)
+                facts = (*tuple(fact for fact in facts if fact.exit_key not in balanced_exits), *exact)
+                retained.update(fact.variable_id for fact in exact)
+                scoped_flags.update(
+                    fact for fact in exact if (fact.register_offset, fact.byte_width) == arch.registers["flags"]
+                )
+        if experimental_gp_exit or facts or return_frames:
             blocks = {(block.addr, block.idx): block for block in graph}
-            coordinates = {arch.registers[name] for name in ("bx", "cx", "dx")}
-            if stack_exit:
-                coordinates.add(arch.registers["sp"])
-            if frame_base_exit:
-                coordinates.add(arch.registers["bp"])
-            if flags_exit:
-                coordinates.add(arch.registers["flags"])
-            proven_flags = set()
-            if flags_exit:
-                if entry is not None:
-                    flag_coordinate = arch.registers["flags"]
-                    for exit_block in graph:
-                        if not exit_block.statements or not isinstance(exit_block.statements[-1], Return):
-                            continue
-                        key = (exit_block.addr, exit_block.idx)
-                        edge_facts = _agreed_gp_exit_definitions_8616(
-                            graph, entry, exit_block, {flag_coordinate},
+            if experimental_gp_exit:
+                coordinates = {arch.registers[name] for name in ("bx", "cx", "dx")}
+                if stack_exit:
+                    coordinates.add(arch.registers["sp"])
+                if frame_base_exit:
+                    coordinates.add(arch.registers["bp"])
+                if flags_exit:
+                    coordinates.add(arch.registers["flags"])
+            else:
+                coordinates = {(fact.register_offset, fact.byte_width) for fact in facts}
+            proven_flags = scoped_flags
+            if experimental_gp_exit and flags_exit and entry is not None:
+                flag_coordinate = arch.registers["flags"]
+                for exit_block in graph:
+                    if not exit_block.statements or not isinstance(exit_block.statements[-1], Return):
+                        continue
+                    key = (exit_block.addr, exit_block.idx)
+                    edge_facts = _agreed_gp_exit_definitions_8616(
+                        graph, entry, exit_block, {flag_coordinate},
+                    )
+                    observed = tuple(
+                        fact for fact in facts if fact.exit_key == key
+                        and (fact.register_offset, fact.byte_width) == flag_coordinate
+                    )
+                    if os.getenv("INERTIA_DEBUG_FLAGS_EXIT_BINDING") == "1":
+                        print("[flags-exit-binding]", key, "observed", observed, "edge", edge_facts)
+                    if edge_facts is not None:
+                        proven_flags.update(edge_facts)
+                    if edge_facts is not None and edge_facts != observed:
+                        # Prefer the exact edge-authenticated value over
+                        # the block-end observation when the CFG admits
+                        # a complete lane proof.
+                        facts = (
+                            *tuple(fact for fact in facts if fact.exit_key != key
+                                   or (fact.register_offset, fact.byte_width) != flag_coordinate),
+                            *edge_facts,
                         )
-                        observed = tuple(
-                            fact for fact in facts if fact.exit_key == key
-                            and (fact.register_offset, fact.byte_width) == flag_coordinate
-                        )
-                        if os.getenv("INERTIA_DEBUG_FLAGS_EXIT_BINDING") == "1":
-                            print("[flags-exit-binding]", key, "observed", observed, "edge", edge_facts)
-                        if edge_facts is not None:
-                            proven_flags.update(edge_facts)
-                        if edge_facts is not None and edge_facts != observed:
-                            # Prefer the exact edge-authenticated value over
-                            # the block-end observation when the CFG admits
-                            # a complete lane proof.
-                            facts = (
-                                *tuple(fact for fact in facts if fact.exit_key != key
-                                       or (fact.register_offset, fact.byte_width) != flag_coordinate),
-                                *edge_facts,
-                            )
-                            retained.update(fact.variable_id for fact in edge_facts)
+                        retained.update(fact.variable_id for fact in edge_facts)
             if (
-                os.getenv("INERTIA_EXPERIMENTAL_GP_EXIT_LANES") == "1"
+                experimental_gp_exit and os.getenv("INERTIA_EXPERIMENTAL_GP_EXIT_LANES") == "1"
                 and entry is not None
             ):
                 gp_names = (
@@ -1096,10 +1259,8 @@ def _apply_native_gp_return_dce_guard_8616() -> None:
                 }
                 for key, block in blocks.items()
             }
-            if os.getenv("INERTIA_EXPERIMENTAL_WORD_FAR_RETURN") == "1":
-                for frame in _native_word_far_return_inputs_8616(
-                    self.project, graph, view, entry, model.all_vvar_definitions,
-                ):
+            if return_frames:
+                for frame in return_frames:
                     key = frame.definition.exit_key
                     sp_coordinate = arch.registers["sp"]
                     if sp_coordinate in published[key]:
@@ -1131,6 +1292,8 @@ def _apply_native_gp_return_dce_guard_8616() -> None:
                 if coordinate not in coordinates or coordinate in published[fact.exit_key]:
                     continue
                 use = fact.bind_exit_use(blocks, self._ail_manager.next_atom)
+                if use is None and not experimental_gp_exit:
+                    raise ValueError(f"cannot bind proven GP word exit operand: {fact}")
                 if use is not None:
                     if fact in proven_flags:
                         carry_sources = {}
@@ -1150,6 +1313,27 @@ def _apply_native_gp_return_dce_guard_8616() -> None:
                                                   stmt, "carry", _packed_carry_source_8616(stmt.src))
                     pending.setdefault(fact.exit_key, []).append(use)
                     published[fact.exit_key].add(coordinate)
+            for group in balanced_uses:
+                key = group.frame.definition.exit_key
+                required = {arch.registers["sp"]}
+                required.update((fact.register_offset, fact.byte_width) for fact in group.definitions)
+                missing = required - published[key]
+                if missing:
+                    count = len(required)
+                    raise PipelineHardError(
+                        "balanced word RETF exit group was not completely materialized",
+                        layer="ir:native_balanced_word_retf",
+                        function_addr=self.func.addr,
+                        details={
+                            "exit_key": key,
+                            "missing_coordinates": tuple(sorted(missing)),
+                            "raw_fact_count": count,
+                            "normalized_fact_count": count,
+                            "classified_fact_count": count,
+                            "materialized_count": count - len(missing),
+                            "failure_count": len(missing),
+                        },
+                    )
             for key, uses in pending.items():
                 block = blocks[key]
                 terminal = block.statements[-1]

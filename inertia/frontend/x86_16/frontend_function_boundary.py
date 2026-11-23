@@ -19,6 +19,7 @@ from .frontend_capstone_block import DirectCapstoneBlock8616
 from .frontend_instruction_reachability import (
     ConditionalDosExit8616,
     ConditionalIndirectEdge8616,
+    ConditionalRelativeEdge8616,
     collect_instruction_reachability_8616,
 )
 from .frontend_near_return_continuation import (
@@ -58,7 +59,7 @@ class ExactFunctionRangeBoundary8616:
     )
 
     decode_lower_bound: int | None = None
-    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalDosExit8616, ...] = ()
+    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalRelativeEdge8616 | ConditionalDosExit8616, ...] = ()
 
     @property
     def decode_start(self) -> cython.longlong:
@@ -88,8 +89,12 @@ def exact_function_range_boundary_8616(
     end: cython.longlong,
     *,
     premise: NearCallFramePremise8616 | None = None,
+    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalRelativeEdge8616 | ConditionalDosExit8616, ...] = (),
 ) -> ExactFunctionRangeBoundary8616 | None:
     """Materialize a range only when every reachable block is classified.
+
+    Conditional census edges close decoding only; semantic import still
+    requires an independent proof under the consuming invocation scope.
 
     ``premise`` is the independently supplied source-bound entry-frame
     premise: a proven near-CALL row binds ``SS:[SP]`` to its return word
@@ -104,7 +109,7 @@ def exact_function_range_boundary_8616(
     """
     if not isinstance(start, int) or not isinstance(end, int) or end <= start:
         return None
-    return _bounded_entry_function_boundary_8616(project, start, start, end, premise)
+    return _bounded_entry_function_boundary_8616(project, start, start, end, premise, conditional_edges)
 
 
 @cython.ccall
@@ -185,7 +190,7 @@ def _bounded_entry_function_boundary_8616(
         blocks=reachability.blocks,
         near_return_continuations=continuations,
         decode_lower_bound=lower,
-        conditional_edges=conditional_edges,
+        conditional_edges=reachability.conditional_edges,
     )
 
 

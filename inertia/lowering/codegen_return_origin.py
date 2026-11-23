@@ -2,29 +2,32 @@
 """Transport return-value origins across native AIL-to-C conversion.
 
 Layer: Types/Lowering.
-Responsibility: preserve existing per-use instruction provenance on C returns,
-not on interned C variables. This is source identity, not semantic proof.
-Consumers must join it to IR/CFG and Alias evidence before accepting a value.
-No value, path, storage, signature or return expression is recovered here.
-Consumes alias, widening, and typed facts; this adapter transports origin metadata.
+Responsibility: preserve per-use instruction provenance on C returns and
+lower explicit architectural exit consumers. Exit consumers carry the IR-proven
+value and exact destination view; C lowering does not infer either one.
+Other consumers must join origin metadata to IR/CFG and Alias evidence before
+accepting a value. No path, storage, signature or return expression is recovered here.
 Do not recover semantics from COD, source, assembly, or rendered C text.
 """
 
 from __future__ import annotations
-import os
-import typing
-import cython
 
+import dataclasses
+import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from typing import Protocol, cast
 
+import cython
 from angr import ailment
 from angr.analyses.decompiler.structured_codegen.c import (
-    CBinaryOp, CConstant, CExpression, CReturn, CStructuredCodeGenerator, CTypeCast,
+    CBinaryOp,
+    CConstant,
+    CExpression,
+    CReturn,
+    CStructuredCodeGenerator,
+    CTypeCast,
 )
 from angr.sim_type import SimTypeInt, SimTypeShort
-import dataclasses
 
 _ORIGIN_TAG = "inertia_x86_16_return_value_origin"
 
@@ -149,16 +152,21 @@ def apply_codegen_return_origin_8616() -> None:
         effect = statement.expr
         coordinate = statement.tags.get("inertia_gp_exit_coordinate")
         if (
-            self.project.arch.name != "86_16" or coordinate is None
-            or not isinstance(effect, ailment.Expr.Call)
+            self.project.arch.name != "86_16" or not isinstance(effect, ailment.Expr.Call)
             or effect.target != "inertia_architectural_gp_exit"
         ):
             return original_effect(self, statement, is_expr=is_expr, **kwargs)
         from .gp_register_state import runtime_gp_state_assignment_8616
 
-        if is_expr or len(effect.args or ()) != 1 or len(coordinate) != 2:
+        if (
+            is_expr or len(effect.args or ()) != 1
+            or not isinstance(coordinate, (tuple, list)) or len(coordinate) != 2
+        ):
             raise ValueError("invalid architectural GP exit operand")
-        offset, width = coordinate
+        offset = _nonnegative_integer(coordinate[0])
+        width = _nonnegative_integer(coordinate[1])
+        if offset is None or not width:
+            raise ValueError("invalid architectural GP exit coordinate")
         near = "inertia_word_near_return_cleanup" in statement.tags
         interrupt = "inertia_word_interrupt_return" in statement.tags
         cleanup = statement.tags.get(
@@ -166,11 +174,15 @@ def apply_codegen_return_origin_8616() -> None:
             "inertia_word_near_return_cleanup" if near else "inertia_word_far_return_cleanup"
         )
         if cleanup is not None:
+            from inertia.semantics.terminal_return_contract import (
+                WordFarReturnLayout8616,
+                WordInterruptReturnLayout8616,
+                WordNearReturnLayout8616,
+            )
+
             from .far_return_boundary_carriers import bind_word_far_return_effect_8616
-            from .segment_register_state import runtime_segment_state_cvar_8616
             from .gp_register_state import runtime_gp_state_expr_8616
-            from inertia.semantics.terminal_return_contract import WordFarReturnLayout8616, WordNearReturnLayout8616
-            from inertia.semantics.terminal_return_contract import WordInterruptReturnLayout8616
+            from .segment_register_state import runtime_segment_state_cvar_8616
 
             site = statement.tags.get("ins_addr")
             if (
@@ -203,7 +215,8 @@ def apply_codegen_return_origin_8616() -> None:
                 self, self._func.addr, cast(CExpression, self._handle(effect.args[0])),
             )
             from inertia.ir.status_flag_exit_projection import (
-                bind_status_flag_phi_origins_8616, function_status_flag_exit_origins_8616,
+                bind_status_flag_phi_origins_8616,
+                function_status_flag_exit_origins_8616,
             )
 
             site = statement.tags.get("ins_addr")
@@ -240,7 +253,10 @@ def apply_codegen_return_origin_8616() -> None:
                         tags["inertia_status_flag_exit_phi_carry_sources"] = tuple(sorted(carry_sources.items()))
                 result.tags = tags
             return result
-        register = self.project.arch.translate_register_name(offset, size=width)
+        arch = self.project.arch
+        register = arch.translate_register_name(offset, size=width)
+        if arch.registers.get(register) != (offset, width):
+            raise ValueError(f"no exact architectural GP exit view: {(offset, width)}")
         result = runtime_gp_state_assignment_8616(
             register, cast(CExpression, self._handle(effect.args[0])),
             codegen=self, function_addr=self._func.addr, exit_only=True,
@@ -250,7 +266,7 @@ def apply_codegen_return_origin_8616() -> None:
         result.tags = {
             **result.tags,
             "ins_addr": statement.tags.get("ins_addr"),
-            "inertia_gp_exit_coordinate": tuple(coordinate),
+            "inertia_gp_exit_coordinate": (offset, width),
         }
         return result
 

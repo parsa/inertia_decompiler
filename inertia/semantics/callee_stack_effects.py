@@ -10,27 +10,37 @@ Do not perform alias-state ownership, widening, lowering/materialization, struct
 """
 
 from __future__ import annotations
-import logging
-import os
+
+import dataclasses
 import hashlib
 import json
-from pathlib import Path
-import typing
-import cython
-import pyvex
-import angr
-from capstone import CS_GRP_JUMP
-
+import logging
+import operator
+import os
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from enum import StrEnum
+from itertools import pairwise
+from pathlib import Path
+
+import angr
+import cython
+import pyvex
+from capstone import CS_GRP_JUMP
 
 from inertia.alias.callee_stack_pointer import (
     CalleeStackPointerResult8616,
     prove_callee_stack_pointer_8616,
 )
+from inertia.frontend.x86_16.frontend_function_boundary import (
+    ExactFunctionRangeBoundary8616,
+)
+from inertia.frontend.x86_16.mz_invocation_source import MzInvocationSource8616
 from inertia.frontend.x86_16.relative_control_edge import (
-    DecodedRelativeEdge, RelativeEdgeForm, bounded_relative_destination, decode_relative_edge,
+    DecodedRelativeEdge,
+    RelativeEdgeForm,
+    bounded_relative_destination,
+    decode_relative_edge,
 )
 from inertia.frontend.x86_16.synthetic_call_stub_evidence import is_synthetic_call_stub_8616
 from inertia.ir.function_ir_registry import (
@@ -45,8 +55,6 @@ from .bp_call_preservation import _exact_boundary_8616
 from .callsite_summary import CallsiteMachineFrameKind8616
 from .direct_ret_call_effect import direct_call_target_is_bound_8616
 from .terminal_return_contract import WordFarReturnLayout8616
-import dataclasses
-import operator
 
 
 class CalleeStackCallFailure8616(StrEnum):
@@ -343,9 +351,9 @@ class CalleeStackCallResult8616:
 
 
     def preserved_frame_far_continuation(
-        self, frame: SavedFarReturnFrame8616,
+        self, frame: SavedFarReturnFrame8616, *, image: MzInvocationSource8616 | None = None,
     ) -> FarReturnContinuation8616 | None:
-        """Prove that each reachable RETF reads the original saved words."""
+        """Prove each reachable RETF reads the saved words, respecting any supplied image."""
         if (
             not self._call_identity_is_current() or self.body is None
             or not self._saved_frame_matches_call_8616(frame)
@@ -354,10 +362,30 @@ class CalleeStackCallResult8616:
         delta = self.body.return_sp_delta
         if delta is None:
             return None
-        return _prove_saved_frame_returns_8616(self.project, self.body.coverage.boundary, frame, delta)
+        return _prove_saved_frame_returns_8616(
+            self.project, self.body.coverage.boundary, frame, delta, image=image,
+        )
 
 
-def _prove_saved_frame_returns_8616(project, boundary, frame, delta, *, dos_sites=frozenset(), image=None):
+@dataclass(frozen=True)
+class _StackByteAddress8616:
+    """A byte in the proved entry SS at a modular offset from instruction-entry SP."""
+
+    sp_delta: int
+
+
+@dataclass(frozen=True)
+class _SavedFrameByteStore8616:
+    """One lifted byte store; a plain integer address is loader-linear."""
+
+    address: int | _StackByteAddress8616
+    value: int | None
+
+
+def _prove_saved_frame_returns_8616(
+    project: angr.Project, boundary: ExactFunctionRangeBoundary8616, frame: SavedFarReturnFrame8616,
+    delta: int | None, *, dos_sites: frozenset[int] = frozenset(), image: MzInvocationSource8616 | None = None,
+) -> FarReturnContinuation8616 | None:
     """Check saved words over the exact selector-bound body graph."""
     sp_offset, sp_size = project.arch.registers["sp"]
     ss_offset, ss_size = project.arch.registers["ss"]
@@ -373,23 +401,24 @@ def _prove_saved_frame_returns_8616(project, boundary, frame, delta, *, dos_site
         (((frame.stack_segment << 4) + ((frame.ip_slot + index) & 0xFFFF)) & 0xFFFFF): (index, byte)
         for index, byte in enumerate(frame.return_ip.to_bytes(2, "little") + frame.caller_cs.to_bytes(2, "little"))
     }
-    writes: dict[int, dict[int, bool]] = {}
+    writes: dict[int, list[_SavedFrameByteStore8616]] = {}
     expected_edges: dict[int, set[int]] = {}
     sp_steps: dict[int, tuple[int, int]] = {}
+    fetch_bytes: set[int] = set()
     for addr in boundary.reachable_instruction_addrs:
         native = project.factory.block(addr, num_inst=1, opt_level=0)
+        fetch_bytes.update((addr + lane) & 0xFFFFF for lane in range(native.size))
         if image is not None:
             offset = addr - image.module_base
             if (
                 not 0 <= offset <= len(image.module) - native.size
                 or image.module[offset:offset + native.size] != bytes(native.bytes)
-                or any((addr + lane) & 0xFFFFF in saved_bytes for lane in range(native.size))
             ):
                 return None
         if addr in dos_sites:
             if bytes(native.bytes) != b"\xcd\x21":
                 return None
-            writes[addr] = {}
+            writes[addr] = []
             continue
         vex = native.vex
         if vex.jumpkind not in {"Ijk_Boring", "Ijk_Ret"}:
@@ -417,23 +446,27 @@ def _prove_saved_frame_returns_8616(project, boundary, frame, delta, *, dos_site
                     return None
                 expected_edges[addr] = {fallthrough}
         temporaries: dict[int, pyvex.expr.IRExpr] = {}
-        lane_writes: dict[int, bool] = {}
+        stores: list[_SavedFrameByteStore8616] = []
         for row in vex.statements:
+            if addr in sp_steps and any(
+                isinstance(expr, pyvex.expr.Get) and expr.offset == sp_offset
+                for expr in row.child_expressions
+            ):
+                # SSA temporaries read before PUT(SP) are still valid, but a
+                # new GET(SP) no longer denotes the instruction-entry word.
+                return None
             if isinstance(row, pyvex.stmt.Store):
-                head = _frame_store_constant_8616(row.addr, temporaries, ss_offset, frame.stack_segment)
-                bits = row.data.result_size(vex.tyenv)
-                if head is None or bits != 8:
+                if row.data.result_size(vex.tyenv) != 8:
                     return None
-                if image is not None and any(
-                    image.module_base <= address < image.module_base + len(image.module)
-                    for address in (head & 0xFFFFF, (head & 0xFFFFF) + 0x100000)
-                ):
-                    return None
-                aliased = saved_bytes.get(head & 0xFFFFF)
-                if aliased is not None:
-                    lane, original = aliased
-                    value = _frame_store_constant_8616(row.data, temporaries, ss_offset, frame.stack_segment)
-                    lane_writes[lane] = value == original
+                head: int | _StackByteAddress8616 | None = _frame_store_constant_8616(
+                    row.addr, temporaries, ss_offset, frame.stack_segment,
+                )
+                if head is None:
+                    head = _frame_stack_byte_address_8616(row.addr, temporaries, ss_offset, sp_offset)
+                    if head is None:
+                        return None
+                value = _frame_store_constant_8616(row.data, temporaries, ss_offset, frame.stack_segment)
+                stores.append(_SavedFrameByteStore8616(head, value))
                 continue
             if isinstance(row, pyvex.stmt.WrTmp):
                 temporaries[row.tmp] = row.data
@@ -449,7 +482,7 @@ def _prove_saved_frame_returns_8616(project, boundary, frame, delta, *, dos_site
                 end = row.offset + bits // 8
                 if row.offset < ss_offset + ss_size and ss_offset < end:
                     return None
-                if delta is None and not returning and row.offset < sp_offset + sp_size and sp_offset < end:
+                if not returning and row.offset < sp_offset + sp_size and sp_offset < end:
                     if addr in sp_steps or (row.offset, bits) != (sp_offset, 16):
                         return None
                     affine = _affine_sp_word_8616(row.data, temporaries, sp_offset)
@@ -458,17 +491,17 @@ def _prove_saved_frame_returns_8616(project, boundary, frame, delta, *, dos_site
                     sp_steps[addr] = affine
                 if not returning and row.offset < cs_offset + cs_size and cs_offset < end:
                     return None
-        writes[addr] = lane_writes
+        writes[addr] = stores
         if returning:
             continuation = prove_immediate_far_return_8616(frame, native.bytes)
             if continuation is None or (delta is not None and (delta & 0xFFFF) != ((4 + continuation.cleanup) & 0xFFFF)):
                 return None
             continuations.add(continuation)
             return_instructions.add(addr)
-    if len(continuations) != 1:
+    if len(continuations) != 1 or not fetch_bytes.isdisjoint(saved_bytes):
         return None
     if not _saved_bytes_match_at_returns_8616(
-        boundary, writes, return_instructions, expected_edges, sp_steps, frame.ip_slot,
+        boundary, writes, return_instructions, expected_edges, sp_steps, frame, saved_bytes, fetch_bytes, image,
     ):
         return None
     return dataclasses.replace(
@@ -499,10 +532,50 @@ def _affine_sp_word_8616(
     return None
 
 
+def _frame_stack_byte_address_8616(
+    value: pyvex.expr.IRExpr, temporaries: dict[int, pyvex.expr.IRExpr],
+    ss_offset: int, sp_offset: int,
+) -> _StackByteAddress8616 | None:
+    """Recognize exactly (SS << 4) + zero-extended affine word SP."""
+    def producer(expr: pyvex.expr.IRExpr) -> pyvex.expr.IRExpr | None:
+        for _ in range(20):
+            if not isinstance(expr, pyvex.expr.RdTmp):
+                return expr
+            source = temporaries.get(expr.tmp)
+            if source is None:
+                return None
+            expr = source
+        return None
+
+    address = producer(value)
+    if not isinstance(address, pyvex.expr.Binop) or address.op != "Iop_Add32":
+        return None
+    for base_arg, word_arg in (address.args, tuple(reversed(address.args))):
+        base, word = producer(base_arg), producer(word_arg)
+        if not isinstance(base, pyvex.expr.Binop) or base.op != "Iop_Shl32":
+            continue
+        shift = producer(base.args[1])
+        if not isinstance(shift, pyvex.expr.Const) or shift.con.value != 4:
+            continue
+        segment = producer(base.args[0])
+        if not isinstance(segment, pyvex.expr.Unop) or segment.op != "Iop_16Uto32":
+            continue
+        ss = producer(segment.args[0])
+        if not isinstance(ss, pyvex.expr.Get) or (ss.offset, ss.ty) != (ss_offset, "Ity_I16"):
+            continue
+        if not isinstance(word, pyvex.expr.Unop) or word.op != "Iop_16Uto32":
+            continue
+        affine = _affine_sp_word_8616(word.args[0], temporaries, sp_offset)
+        if affine is not None and affine[0] == 1:
+            return _StackByteAddress8616(affine[1])
+    return None
+
+
 def _saved_bytes_match_at_returns_8616(
-    boundary: object, writes: dict[int, dict[int, bool]], returns: set[int],
-    expected_edges: dict[int, set[int]],
-    sp_steps: dict[int, tuple[int, int]], entry_sp: int,
+    boundary: ExactFunctionRangeBoundary8616, writes: dict[int, list[_SavedFrameByteStore8616]], returns: set[int],
+    expected_edges: dict[int, set[int]], sp_steps: dict[int, tuple[int, int]],
+    frame: SavedFarReturnFrame8616, saved_bytes: dict[int, tuple[int, int]],
+    fetch_bytes: set[int], image: MzInvocationSource8616 | None,
 ) -> bool:
     """Propagate possibly changed byte lanes over the certified body graph."""
     instructions = sorted(writes)
@@ -522,11 +595,12 @@ def _saved_bytes_match_at_returns_8616(
     for origin, target in boundary.successor_edges:
         successors[origin].append(target)
     for addr, sites in blocks.items():
-        for site, following in zip(sites, sites[1:]):
+        for site, following in pairwise(sites):
             if expected_edges.get(site) != {following}:
                 return False
         if expected_edges.get(sites[-1], set()) != set(successors[addr]):
             return False
+    entry_sp = frame.ip_slot
     incoming: dict[int, tuple[int, int | None]] = {boundary.addr: (0, entry_sp)}
     pending = [boundary.addr]
     checked_returns = set()
@@ -538,17 +612,33 @@ def _saved_bytes_match_at_returns_8616(
                 if changed or sp != entry_sp or writes[site] or site != blocks[addr][-1] or successors[addr]:
                     return False
                 checked_returns.add(site)
+            for store in writes[site]:
+                address = store.address
+                if isinstance(address, _StackByteAddress8616):
+                    if sp is None:
+                        return False
+                    address = (frame.stack_segment << 4) + ((sp + address.sp_delta) & 0xFFFF)
+                physical = address & 0xFFFFF
+                if physical in fetch_bytes:
+                    return False
+                if image is not None and any(
+                    image.module_base <= candidate < image.module_base + len(image.module)
+                    for candidate in (physical, physical + 0x100000)
+                ):
+                    return False
+                aliased = saved_bytes.get(physical)
+                if aliased is not None:
+                    lane, original = aliased
+                    if store.value == original:
+                        changed &= ~(1 << lane)
+                    else:
+                        changed |= 1 << lane
             if site in sp_steps:
                 coefficient, constant = sp_steps[site]
                 if coefficient == 0:
                     sp = constant
                 elif sp is not None:
                     sp = (coefficient * sp + constant) & 0xFFFF
-            for lane, original in writes[site].items():
-                if original:
-                    changed &= ~(1 << lane)
-                else:
-                    changed |= 1 << lane
         for successor in successors[addr]:
             previous = incoming.get(successor)
             merged = (changed, sp) if previous is None else (

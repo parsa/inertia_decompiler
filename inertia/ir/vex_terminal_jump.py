@@ -4,14 +4,16 @@
 Layer: IR.
 Responsibility: decide, from the exact decoded bytes of the last machine
 instruction and the block's VEX ``next`` operand, whether an ``Ijk_Boring``
-block tail is a real unconditional near-relative jump whose instruction and
-destination must survive as explicit IR. A loader-linear constant destination
-is published only when the ``control_coordinates`` CS-relative composition is
+block tail is an unconditional near-relative or immediate far jump whose
+instruction and destination must survive as explicit IR. Far jumps require agreement
+between the encoded pointer, the lifted destination, and the in-function CFG.
+For near-relative jumps, a loader-linear constant destination is published
+only when the ``control_coordinates`` CS-relative composition is
 invariant across every segment selector capable of fetching the instruction
 under the native architectural fetch domain; otherwise the retained jump
 keeps its symbolic operand and the block records a typed refusal.
-Conditional, call, far, indirect, and fallthrough block tails never become
-jumps here. A separate CALL evidence API reuses the native destination proof
+Conditional, call, indirect, and fallthrough block tails never become jumps
+here. A separate CALL evidence API reuses the native destination proof
 without synthesizing a jump instruction.
 Owns typed Value, Address, Condition, instruction facts, and lossless
 normalization.
@@ -20,26 +22,26 @@ structuring, rewrite, postprocess, or CLI/reporting work here.
 """
 
 from __future__ import annotations
-import typing
-import cython
 
+import dataclasses
+import operator
 from collections.abc import Mapping
-from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
+
+import cython
 
 from inertia.frontend.x86_16.relative_control_edge import (
     DecodedRelativeEdge,
     RelativeEdgeForm,
-    decode_relative_edge,
     bounded_relative_destination,
+    decode_relative_edge,
 )
+from inertia.frontend.x86_16.stack_helpers import far_linear_target_8616
 
 from .core import IRRefusal
 from .regs import register_name_from_offset
 from .vex_types import vex_expr_size_bytes
-import dataclasses
-import operator
 
 __all__ = (
     "NativeRelativeCallEvidence8616",
@@ -70,7 +72,9 @@ _DWORD_OPERAND_BITS_8616 = 32
 
 
 class TerminalJumpRefusalReason8616(StrEnum):
-    """Typed reason a retained terminal jump keeps a symbolic destination."""
+    """Typed reason an identified terminal jump lacks admitted transfer evidence."""
+
+    FAR_JUMP_UNMODELED = "terminal_far_jump_unmodeled"
 
     NEXT_OPERAND_MALFORMED = "terminal_jump_next_operand_malformed"
     SHAPE_MISMATCH = "terminal_jump_shape_mismatch"
@@ -149,16 +153,14 @@ class _NextShape8616:
 class TerminalJumpEvidence8616:
     """Closed evidence decision for one ``Ijk_Boring`` block terminal.
 
-    ``retain`` is True only when the exact terminal instruction bytes decode
-    to an unconditional near-relative jump. ``proven_target`` is a
-    loader-linear destination only when the VEX ``next`` operand is the
-    lifter's composition for those bytes and the decoded target is reachable
-    under every selector in the instruction's fetch domain. ``failure``
-    carries the typed reason when the destination could not be proven; the
-    same reason is recorded in ``refusals`` for block-level reporting.
-    ``decoded`` retains the exact-bytes decoded transfer behind a retained
-    jump so a separately proved control-domain theorem can discharge the
-    selector-window obligation later without re-reading raw bytes.
+    ``retain`` marks an unconditional near-relative jump or an immediate far
+    jump with a closed in-function edge. ``proven_target`` is loader-linear:
+    near-relative jumps require a proof across the fetch selector window;
+    immediate far jumps require the encoded pair and VEX ``next`` to agree
+    with the exact in-body successor. ``failure`` and ``refusals`` record
+    unproved jumps without treating the existing register writes as complete.
+    ``decoded`` retains the near-relative source for later selector-window
+    proofs without re-reading raw bytes.
     """
 
     retain: cython.bint
@@ -581,6 +583,58 @@ def _evidence_8616(
     )
 
 
+_LEGACY_PREFIX_BYTES_8616: frozenset[int] = frozenset(
+    {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3},
+)
+
+
+def _immediate_far_jump_opcode_index_8616(encoding: bytes) -> int | None:
+    """Identify EA only at the opcode position of the marked instruction."""
+    for index, byte in enumerate(encoding):
+        if byte not in _LEGACY_PREFIX_BYTES_8616:
+            return index if byte == 0xEA else None
+    return None
+
+
+def _immediate_far_jump_target_8616(encoding: bytes, opcode_index: int) -> int | None:
+    """Compose the exact encoded far pointer in the native VEX control domain."""
+    offset_size = 4 if 0x66 in encoding[:opcode_index] else 2
+    operand_start = opcode_index + 1
+    selector_start = operand_start + offset_size
+    if len(encoding) != selector_start + 2:
+        return None
+    offset = int.from_bytes(encoding[operand_start:selector_start], "little")
+    selector = int.from_bytes(encoding[selector_start:], "little")
+    if offset_size == 2:
+        return far_linear_target_8616(selector, offset)
+    return ((selector << 4) + offset) & 0xFFFF_FFFF
+
+
+def _immediate_far_jump_evidence_8616(
+    *,
+    target: int | None,
+    instruction_addr: int,
+    block_addr: int | None,
+    boring: bool,
+    next_expr: object,
+    function_successors: tuple[int, ...],
+) -> TerminalJumpEvidence8616:
+    """Require a matching lifted transfer and closed function edge, not just CS writes."""
+    admitted = (
+        target is not None and boring
+        and _const_value_8616(next_expr) == target and function_successors == (target,)
+    )
+    location = f" to {target:#x}" if target is not None else " with an unresolved pointer"
+    return _evidence_8616(
+        retain=admitted,
+        proven_target=target if admitted else None,
+        failure=None if admitted else TerminalJumpRefusalReason8616.FAR_JUMP_UNMODELED,
+        block_addr=block_addr,
+        classified=True,
+        detail=f"immediate far JMP at {instruction_addr:#x}{location} has no matching in-function CFG edge",
+    )
+
+
 @cython.ccall
 def terminal_direct_jump_evidence_8616(
     block: object,
@@ -591,19 +645,15 @@ def terminal_direct_jump_evidence_8616(
     tmp_exprs: Mapping[cython.longlong, object],
     type_environment: object | None = None,
     selector_bounds: tuple[int, int] = (0, 0xFFFF),
+    function_successors: tuple[int, ...] | None = None,
 ) -> TerminalJumpEvidence8616:
-    """Evaluate one ``Ijk_Boring`` block tail as a native direct jump.
+    """Classify native direct jumps at the exact marked block tail.
 
-    The jump is retained only when the exact terminal bytes decode to an
-    unconditional near-relative form whose marked extent is the block tail.
-    A loader-linear destination is published only when the ``next`` operand
-    is the lifter's composition for the same decoded edge and the resulting
-    target is invariant under the instruction's selector fetch window.
-    Explicit bounds apply only to this invocation; the caller must bind them
-    to the exact instruction and image before use. The default is universal.
-    Non-jump terminals and missing byte evidence return ``retain=False``
-    with a closed zero classification; the instruction's IR effects already
-    carry its semantics, so absence of the marker is not a dropped fact.
+    Near-relative jumps need a matching VEX composition and a destination
+    invariant across the selector window; any bound must be tied to this
+    instruction and image. Only the raw import supplies ``function_successors``
+    (empty if no in-function edge exists) and owns immediate far admission.
+    Other callers request only the near-relative proof.
     """
     encoding: object
     try:
@@ -613,10 +663,10 @@ def terminal_direct_jump_evidence_8616(
         jumpkind, next_expr = "", None
     block_addr = _block_addr_8616(block)
     if (
-        jumpkind != "Ijk_Boring"
-        or type(instruction_addr) is not int
+        type(instruction_addr) is not int
         or instruction_addr < 0
         or type(instruction_size) is not int
+        or (function_successors is None and jumpkind != "Ijk_Boring")
     ):
         return TerminalJumpEvidence8616(
             retain=False,
@@ -626,9 +676,20 @@ def terminal_direct_jump_evidence_8616(
             stats=TerminalJumpEvidenceStats8616(0, 0, 0, 0, 0),
         )
     encoding = _terminal_encoding_8616(block, instruction_addr, instruction_size)
+    if function_successors is not None and isinstance(encoding, bytes):
+        far_opcode_index = _immediate_far_jump_opcode_index_8616(encoding)
+        if far_opcode_index is not None:
+            return _immediate_far_jump_evidence_8616(
+                target=_immediate_far_jump_target_8616(encoding, far_opcode_index),
+                instruction_addr=instruction_addr,
+                block_addr=block_addr,
+                boring=jumpkind == "Ijk_Boring",
+                next_expr=next_expr,
+                function_successors=function_successors,
+            )
     decoded = (
         None
-        if encoding is None
+        if encoding is None or jumpkind != "Ijk_Boring"
         else decode_relative_edge(instruction_addr, encoding, source="block_terminal")
     )
     if not isinstance(decoded, DecodedRelativeEdge):

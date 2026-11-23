@@ -21,6 +21,9 @@ from capstone import CsInsn
 from inertia.frontend.x86_16.arch_86_16 import Arch86_16
 from inertia.frontend.x86_16.frontend_capstone_block import DirectCapstoneBlock8616, DirectCapstoneInstruction8616
 from inertia.frontend.x86_16.frontend_function_boundary import ExactFunctionRangeBoundary8616
+from inertia.frontend.x86_16.frontend_instruction_reachability import (
+    ConditionalRelativeEdge8616,
+)
 
 from .core import IRFunctionArtifact
 from .function_ir_registry import _existing_registry_8616
@@ -104,8 +107,8 @@ def _native_surface_key_8616(
     Returns the freshness key together with the identity-only authorities that
     must stay reachable while a record retains it; a freed authority can have
     its ``id()`` recycled by a different owner behind an unchanged key.
-    ``raw_lift_only`` admits serialized conditional return-lift inputs, never
-    their proof authority. Completed-artifact callers must keep the default.
+    ``raw_lift_only`` admits conditional return and relative-edge lift inputs,
+    never their proof authority. Completed-artifact callers keep the default.
     """
     continuation_key: object
     info: object
@@ -142,6 +145,12 @@ def _native_surface_key_8616(
                 return None
             instructions.append(instruction)
         blocks.append((block.addr, block.size, block.code, tuple(instructions)))
+    # Relative census edges suppress a raw successor even when the exact
+    # boundary's geometry is identical to the ordinary decoded graph.
+    relative_edges = tuple(
+        (edge.block_addr, edge.instruction_addr, edge.target_addr, edge.decoded.encoding)
+        for edge in iter(boundary.conditional_edges) if isinstance(edge, ConditionalRelativeEdge8616)
+    )
     key = (
         id(arch), _architecture_key_8616(arch), id(importer),
         id(build_x86_16_ir_function_artifact),
@@ -149,7 +158,7 @@ def _native_surface_key_8616(
         boundary.block_addrs_set, boundary.reachable_instruction_addrs,
         boundary.successor_edges, tuple(blocks), info,
         status_flag_native_policy_key_8616(project, boundary.addr),
-        continuation_key,
+        continuation_key, relative_edges,
     )
     pinned = (arch, importer, build_x86_16_ir_function_artifact)
     return key, pinned

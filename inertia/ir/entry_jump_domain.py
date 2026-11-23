@@ -104,8 +104,11 @@ import dataclasses
 import operator
 import builtins
 Real16InvocationDomain8616 = typing.TypeVar("Real16InvocationDomain8616")
+FarReturnContinuation8616 = typing.TypeVar("FarReturnContinuation8616")
 
 if TYPE_CHECKING:
+    from inertia.semantics.callee_stack_effects import FarReturnContinuation8616
+
     from .real16_invocation_domain import Real16InvocationDomain8616
 
 __all__ = [
@@ -389,7 +392,9 @@ class EntryJumpDomainProof8616:
     application is bound to it and refuses any other input as stale.
     ``call_preservations`` retains the exact source-bound callsite evidence
     the proof consulted so consumers can audit which calls were admitted
-    onto the region and which kept their default refusal.
+    onto the region and which kept their default refusal. ``far_continuation``
+    retains one exact saved-frame return under ``invocation_scope``; it
+    authorizes only CS in the private solver view, and application replays it.
     """
 
     function_addr: cython.longlong
@@ -404,6 +409,8 @@ class EntryJumpDomainProof8616:
     invocation_scope: Real16InvocationDomain8616 | None = field(default=None, compare=False)
     near_call_scope: NearCallJumpScope8616 | None = field(default=None, compare=False)
 
+    far_continuation: FarReturnContinuation8616 | None = field(default=None, compare=False)
+
     def admitted_target_for(self, head: cython.longlong) -> int | None:
         """Return the proven target for one discharged jump head."""
         jump: object
@@ -415,6 +422,9 @@ class EntryJumpDomainProof8616:
     def to_dict(self) -> dict[str, object]:
         """Serialize the proof product for diagnostics and workers."""
         return {
+            "far_continuation": (
+                None if self.far_continuation is None else dataclasses.asdict(self.far_continuation)
+            ),
             "invocation_scope": None if self.invocation_scope is None else self.invocation_scope.to_dict(),
             "near_call_scope": None if self.near_call_scope is None else self.near_call_scope.to_dict(),
             "function_addr": self.function_addr,
@@ -929,6 +939,74 @@ def _instruction_gate_8616(
     return _effect_gate_8616(instr)
 
 
+def _declared_far_continuation_8616(
+    project: object, artifact: IRFunctionArtifact, scope: Real16InvocationDomain8616 | None,
+) -> FarReturnContinuation8616 | None:
+    """Consume one replayed actual CALL row of an explicitly declared local invocation."""
+    if scope is None:
+        return None
+    from inertia.frontend.x86_16.declared_function_entry import (
+        DeclaredFunctionEntryAdmission8616,
+    )
+    from inertia.frontend.x86_16.mz_invocation_source import (
+        authenticate_loaded_mz_boot_8616,
+    )
+    from inertia.semantics.callee_stack_effects import (
+        prove_direct_callee_stack_effect_8616,
+        prove_far_call_entry_8616,
+    )
+    from inertia.semantics.callsite_summary import CallsiteMachineFrameKind8616
+
+    from .real16_invocation_domain import (
+        DeclaredFunctionEntryLink8616,
+        Real16InvocationDomain8616,
+    )
+
+    if type(scope) is not Real16InvocationDomain8616 or scope.project is not project:
+        return None
+    link = scope.chain
+    if (type(link) is not DeclaredFunctionEntryLink8616 or link.artifact is not artifact
+            or type(link.admission) is not DeclaredFunctionEntryAdmission8616):
+        return None
+    site = scope.callsite_addr
+    calls = [insn for block in artifact.blocks for insn in block.instrs if insn.op == "CALL" and insn.addr == site]
+    if len(calls) != 1 or not scope.complete:
+        return None
+    memory = scope.callsite_memory
+    if memory is None or memory.tainted:
+        return None
+    registers = dict(scope.callsite_call_state)
+    cs, ip, ss, sp = (registers.get(reg) for reg in ("cs", "ip", "ss", "sp"))
+    if cs is None or ip is None or ss is None or sp is None:
+        return None
+    target = (cs << 4) + ip
+    entry = prove_far_call_entry_8616(
+        project, callsite_addr=site, target_addr=target, caller_cs=scope.entry_segment,
+        stack_segment=ss, pre_call_sp=(sp + 4) & 0xFFFF,
+    )
+    if entry is None or (entry.callee_cs, entry.callee_ip, entry.callee_sp) != (cs, ip, sp):
+        return None
+    frame = entry.saved_frame
+    known = dict(memory.known)
+    words = frame.return_ip.to_bytes(2, "little") + frame.caller_cs.to_bytes(2, "little")
+    if any(known.get(((ss << 4) + ((sp + i) & 0xFFFF)) & 0xFFFFF) != byte for i, byte in enumerate(words)):
+        return None
+    image = authenticate_loaded_mz_boot_8616(project, link.admission.source)
+    if image is None:
+        return None
+    # A prefix store may not silently replace resident instructions with
+    # bytes differing from the image the callee body proof consumes.
+    start, stop = image.module_base, image.module_base + len(image.module)
+    if (any(start <= address < stop for address in memory.unknown)
+            or any(start <= address < stop and image.module[address - start] != byte
+                   for address, byte in known.items())):
+        return None
+    result = prove_direct_callee_stack_effect_8616(
+        project, site, site + 5, target, CallsiteMachineFrameKind8616.FAR,
+    )
+    return result.preserved_frame_far_continuation(frame, image=image)
+
+
 @cython.cclass
 class _ProofRun8616:
     """Mutable proof session accumulating ledger, refusals, and admissions.
@@ -955,6 +1033,7 @@ class _ProofRun8616:
     near_call_scope = cython.declare(object, visibility = "public")
     normalized = cython.declare(object, visibility = "public")
     offered_invocation_scope = cython.declare(object, visibility = "public")
+    far_continuation = cython.declare(object, visibility = "public")
     pending = cython.declare(dict, visibility = "public")
     project = cython.declare(object, visibility = "public")
     raw_count = cython.declare(object, visibility = "public")
@@ -985,6 +1064,7 @@ class _ProofRun8616:
         self.call_preservations = call_preservations
         self.invocation_resolver = invocation_resolver
         self.offered_invocation_scope = offered_invocation_scope
+        self.far_continuation: FarReturnContinuation8616 | None = None
         self.project = project
         self.binding = binding
         self.raw_count = raw_count
@@ -1353,18 +1433,27 @@ class _ProofRun8616:
         return self._segment_surrogates_8616(instr, preserved)
 
     def _segment_surrogates_8616(
-        self, instr: IRInstr, preserved: object,
-    ) -> object:
-        """Project only authenticated segment preservation into the solver view."""
+        self, instr: IRInstr, preserved: object, *, drop_register_proxies: bool = False,
+    ) -> tuple[IRInstr, ...]:
+        """Project segment kills, optionally also killing every tracked register proxy."""
+        registers = dict.fromkeys(SEGMENT_REGISTERS, 2)
+        if drop_register_proxies:
+            # The solver starts with only segments and learns other identities
+            # solely from register destinations in this source artifact.
+            for block in self.artifact.blocks:
+                for operation in block.instrs:
+                    dst = operation.dst
+                    if isinstance(dst, IRValue) and dst.space is MemSpace.REG and dst.name is not None:
+                        registers.setdefault(dst.name, dst.size)
         surrogates = tuple(
             IRInstr(
                 "MOV",
-                IRValue(MemSpace.REG, name=register, size=2),
-                (IRValue(MemSpace.UNKNOWN, size=2),),
-                size=2,
+                IRValue(MemSpace.REG, name=register, size=width),
+                (IRValue(MemSpace.UNKNOWN, size=width),),
+                size=width,
                 addr=instr.addr,
             )
-            for register in iter(SEGMENT_REGISTERS)
+            for register, width in registers.items()
             if register not in preserved
         )
         if not surrogates:
@@ -1394,14 +1483,29 @@ class _ProofRun8616:
         instr: object
         original: object
         premised = self._far_return_premised_calls_8616(blocks)
-        if not self.call_preservations and self.near_call_scope is None and not premised:
+        far = _declared_far_continuation_8616(self.project, self.artifact, self.offered_invocation_scope)
+        if far is not None and any(
+            record.callsite_addr == far.callsite_addr for record in iter(self.call_preservations)
+        ):
+            far = None
+        self.far_continuation = far
+        if not self.call_preservations and self.near_call_scope is None and not premised and far is None:
             return blocks
         selectors = tuple(record for record in iter(self.call_preservations)
                           if record.selector_projection is not None)
         view: list[IRBlock] = []
         for original, block in zip(self.artifact.blocks, blocks, strict=True):
             instrs: list[IRInstr] = []
+            far_site = far.callsite_addr if far is not None and any(
+                insn.op == "CALL" and insn.addr == far.callsite_addr for insn in original.instrs
+            ) else None
             for instr in block.instrs:
+                if far_site is not None and instr.addr == far_site and (instr.op == "CALL" or _writes_cs_8616(instr)):
+                    if instr.op == "CALL":
+                        instrs.extend(self._segment_surrogates_8616(
+                            instr, frozenset({"cs"}), drop_register_proxies=True,
+                        ))
+                    continue
                 if instr.addr in premised and (instr.op == "CALL" or _writes_cs_8616(instr)):
                     if instr.op == "CALL":
                         instrs.extend(self._far_return_premise_substitutes_8616(instr))
@@ -2008,6 +2112,7 @@ class _ProofRun8616:
             call_preservations=self.call_preservations,
             invocation_scope=self.invocation_scope,
             near_call_scope=self.near_call_scope,
+            far_continuation=self.far_continuation,
         )
 
 
@@ -2235,6 +2340,7 @@ def _application_dependency_facts_8616(proof: EntryJumpDomainProof8616) -> objec
     seen: set[cython.longlong] = set()
     return (
         id(proof.invocation_scope), _scope_facts(proof.invocation_scope, seen),
+        None if proof.far_continuation is None else dataclasses.astuple(proof.far_continuation),
         tuple((id(jump), jump.block_addr, jump.head, jump.target,
                id(jump.invocation), _scope_facts(jump.invocation, seen),
                id(jump.invocation_scope), _scope_facts(jump.invocation_scope, seen),
@@ -2377,6 +2483,8 @@ def _source_call_dependencies_8616(
     instruction: object
     expected: list[EntryDomainCallPreservation8616] = []
     consumed: set[cython.longlong] = set()
+    far = proof.far_continuation
+    far_seen = False
     for block in blocks:
         for instruction in block.instrs:
             if instruction.op != "CALL":
@@ -2385,6 +2493,13 @@ def _source_call_dependencies_8616(
                 record for record in iter(proof.call_preservations)
                 if record.block is block and record.instruction is instruction
             )
+            if far is not None and instruction.addr == far.callsite_addr:
+                # This row is replayed separately against the current native
+                # image after the normal CALL dependency callbacks.
+                if far_seen or records or scope is None:
+                    return None
+                far_seen = True
+                continue
             if len(records) != 1:
                 return None
             record = records[0]
@@ -2396,7 +2511,7 @@ def _source_call_dependencies_8616(
                 return None
             if record.required_scope is not None or record.selector_projection is not None:
                 expected.append(record)
-    if operator.ne(len(consumed), len(proof.call_preservations)):
+    if operator.ne(len(consumed), len(proof.call_preservations)) or (far is not None and not far_seen):
         return None
     selectors = tuple(record for record in iter(expected) if record.selector_projection is not None)
     if operator.ne(len(_selector_call_batch_8616(selectors, scope)), len(selectors)):
@@ -2748,6 +2863,25 @@ class _ApplicationInputPins8616:
 
 
 @cython.ccall
+def _application_source_matches_pins_8616(
+    artifact: IRFunctionArtifact,
+    proof: EntryJumpDomainProof8616,
+    pins: _ApplicationInputPins8616,
+) -> cython.bint:
+    """Compare the current source and retained admissions without replaying a scope."""
+    return (
+        proof.source_binding is pins.binding
+        and proof.near_call_scope is pins.scope
+        and proof.admitted is pins.admitted
+        and operator.eq(artifact.function_addr, pins.root)
+        and operator.eq(proof.function_addr, pins.root)
+        and operator.eq(pins.binding.function_addr, pins.root)
+        and operator.eq(pins.binding.digest, pins.digest)
+        and operator.eq(pins.digest, _source_digest_8616(artifact.function_addr, artifact.blocks))
+    )
+
+
+@cython.ccall
 def _final_application_seal_refused_8616(
     artifact: IRFunctionArtifact,
     proof: EntryJumpDomainProof8616,
@@ -2760,21 +2894,7 @@ def _final_application_seal_refused_8616(
         scope, project=scope.project, artifact=artifact,
     ):
         return True
-    identities_match = (
-        proof.source_binding is pins.binding
-        and proof.near_call_scope is scope
-        and proof.admitted is pins.admitted
-    )
-    roots_match = (
-        operator.eq(artifact.function_addr, pins.root)
-        and operator.eq(proof.function_addr, pins.root)
-        and operator.eq(pins.binding.function_addr, pins.root)
-    )
-    return (
-        not identities_match or not roots_match
-        or operator.ne(pins.binding.digest, pins.digest)
-        or operator.ne(pins.digest, _source_digest_8616(artifact.function_addr, artifact.blocks))
-    )
+    return not _application_source_matches_pins_8616(artifact, proof, pins)
 
 
 @cython.ccall
@@ -2882,6 +3002,19 @@ def _apply_entry_jump_domain_core_8616(
     pins = _ApplicationInputPins8616(
         binding, binding.digest, artifact.function_addr, proof.admitted, near_call_scope,
     )
+    far_receipt = proof.far_continuation
+    far_scope = proof.invocation_scope
+    far = far_receipt
+    far_dependencies: object = None
+    if far_receipt is not None:
+        from inertia.semantics.callee_stack_effects import FarReturnContinuation8616
+
+        from .real16_invocation_domain import Real16InvocationDomain8616
+
+        if type(far_receipt) is not FarReturnContinuation8616 or type(far_scope) is not Real16InvocationDomain8616:
+            return _stale_sealed_application_8616(artifact, unproved_call_stats)
+        far = dataclasses.replace(far_receipt)
+        far_dependencies = _application_dependency_facts_8616(proof)
     stale_detail = _application_stale_detail_8616(
         artifact, proof, binding, invocation_scope, near_call_scope, seal,
     )
@@ -2966,6 +3099,18 @@ def _apply_entry_jump_domain_core_8616(
         )
     ):
         return _stale_sealed_application_8616(artifact, unproved_call_stats)
+    if far is not None and far_scope is not None and pins.admitted:
+        # Replaying the retained scope invokes boot_recompute. Read the result
+        # first, then seal scope, return receipt and source without callbacks.
+        replayed = _declared_far_continuation_8616(far_scope.project, artifact, far_scope)
+        if (
+            far != replayed
+            or proof.invocation_scope is not far_scope
+            or proof.far_continuation is not far_receipt
+            or operator.ne(_application_dependency_facts_8616(proof), far_dependencies)
+            or not _application_source_matches_pins_8616(artifact, proof, pins)
+        ):
+            return _stale_sealed_application_8616(artifact, unproved_call_stats)
     admitted_calls = calls if isinstance(calls, tuple) else ()
     call_stats = EntryJumpDomainStats8616(
         raw_calls, raw_calls if isinstance(calls, tuple) else 0,
