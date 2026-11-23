@@ -22,6 +22,7 @@
   "dependencies": [],
   "guide": "reference/decompiler-map.md",
   "tests": [
+    "tests/validation/test_split_word_stores.py",
     "tests/ir/test_entry_jump_domain_far_continuation.py",
     "tests/ir/test_native_gp_word_exit.py",
     "tests/ir/test_native_immediate_far_jump.py",

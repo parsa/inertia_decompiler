@@ -37,6 +37,15 @@ from angr.sim_variable import SimMemoryVariable
 from archinfo import Arch
 
 from inertia.ir.core import AddressStatus, IRAddress, MemSpace, SegmentOrigin
+from inertia.ir.function_ssa_registry import (
+    FunctionSSAArtifactVerdict8616,
+    registered_function_ssa_artifact_8616,
+)
+from inertia.ir.logical_memory_contracts import (
+    IRLogicalMemoryAccess8616,
+    IRLogicalMemoryAccessKey8616,
+    IRMemoryAccessKind8616,
+)
 from inertia.lowering.runtime_segment_access import runtime_segment_access_space_8616
 from inertia.lowering.segmented_global_loads import DirectSegmentedGlobalStoreEvidence8616
 from inertia.widening.segmented_load_identity import segmented_load_identity_8616
@@ -75,6 +84,7 @@ class RequiredMemoryEffectIssueKind8616(Enum):
 
     MALFORMED_EVIDENCE = "malformed_evidence"
     MISSING_WRITE = "missing_write"
+    SPLIT_WORD_STORE = "split_word_store"
 
 
 @dataclasses.dataclass(frozen=True, )
@@ -84,9 +94,16 @@ class RequiredMemoryEffectIssue8616:
     kind: RequiredMemoryEffectIssueKind8616
     effect: DirectSegmentedGlobalStoreEvidence8616 | None = None
     source_index: int | None = None
+    word_store: IRLogicalMemoryAccessKey8616 | None = None
 
     def token(self) -> str:
         """Return a stable diagnostic token for snapshots and tests."""
+        if self.word_store is not None:
+            key = self.word_store
+            return (
+                f"split-word-store:block=0x{key.block_addr:x}:"
+                f"ins=0x{key.insn_addr:x}:access={key.access_ordinal}"
+            )
         if self.effect is None:
             return f"malformed-required-memory-effect:index={self.source_index}"
         effect = self.effect
@@ -395,6 +412,72 @@ def _effect_is_well_formed_8616(effect: DirectSegmentedGlobalStoreEvidence8616) 
     )
 
 
+def split_word_store_issues_8616(
+    accesses: Iterable[IRLogicalMemoryAccess8616],
+    writes: Iterable[_FinalSegmentedWrite8616],
+) -> tuple[RequiredMemoryEffectIssue8616, ...]:
+    """Refuse register-addressed native word stores emitted only as byte stores.
+
+    Identity is the logical access's instruction occurrence, matched to final C
+    assignments carrying the same instruction provenance. Direct-address stores
+    stay owned by the required-direct-store obligations, and stack stores by the
+    stack-frame validators.
+    """
+    word_writes: Counter[int] = Counter()
+    byte_writes: Counter[int] = Counter()
+    for write in writes:
+        if write.ins_addr is None:
+            continue
+        if write.width >= 2:
+            word_writes[write.ins_addr] += 1
+        elif write.width == 1:
+            byte_writes[write.ins_addr] += 1
+    issues: list[RequiredMemoryEffectIssue8616] = []
+    ordered = sorted(
+        (
+            access
+            for access in accesses
+            if access.complete
+            and access.kind is IRMemoryAccessKind8616.WRITE
+            and access.address.size == 2
+            and access.address.space in {MemSpace.DS, MemSpace.ES}
+            and access.address.base
+        ),
+        key=lambda access: (access.key.insn_addr, access.key.access_ordinal),
+    )
+    for access in ordered:
+        ins_addr = access.key.insn_addr
+        if word_writes[ins_addr] > 0:
+            word_writes[ins_addr] -= 1
+        elif byte_writes[ins_addr] >= 2:
+            byte_writes[ins_addr] -= 2
+            issues.append(
+                RequiredMemoryEffectIssue8616(
+                    RequiredMemoryEffectIssueKind8616.SPLIT_WORD_STORE,
+                    word_store=access.key,
+                )
+            )
+    return tuple(issues)
+
+
+def _logical_word_store_issues_8616(
+    project: object,
+    codegen: object,
+    writes: tuple[_FinalSegmentedWrite8616, ...],
+) -> tuple[RequiredMemoryEffectIssue8616, ...]:
+    """Evaluate split word stores from the function's closed logical-memory artifact."""
+    try:
+        resolution = registered_function_ssa_artifact_8616(project, getattr(codegen, "cfunc").addr)
+    except AttributeError:
+        return ()
+    if resolution.verdict is not FunctionSSAArtifactVerdict8616.PROVEN or resolution.artifact is None:
+        return ()
+    logical_memory = resolution.artifact.logical_memory
+    if logical_memory is None or not logical_memory.closed:
+        return ()
+    return split_word_store_issues_8616(logical_memory.accesses, writes)
+
+
 def validate_required_memory_effects_8616(
     project: object,
     codegen: object,
@@ -485,7 +568,8 @@ def validate_required_memory_effects_8616(
             )
         )
     missing = tuple(missing_items)
-    issues = (*malformed, *missing)
+    split_word_stores = _logical_word_store_issues_8616(project, codegen, writes)
+    issues = (*malformed, *missing, *split_word_stores)
     materialized_count = len(normalized) - len(missing)
     return RequiredMemoryEffectValidationReport8616(
         raw_fact_count=len(raw_values),
