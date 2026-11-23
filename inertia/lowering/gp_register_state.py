@@ -19,7 +19,7 @@ from typing import Protocol, cast
 from angr.ailment.expression import VirtualVariableCategory
 from angr.analyses.decompiler.structured_codegen import c as structured_c
 from angr.sim_type import SimTypeLong, SimTypeShort
-from angr.sim_variable import SimMemoryVariable, SimRegisterVariable
+from angr.sim_variable import SimMemoryVariable, SimRegisterVariable, SimTemporaryVariable
 from archinfo import Arch
 
 from inertia.ir.function_ssa_registry import (
@@ -34,6 +34,7 @@ from inertia.lowering.c_ast_utils import (
     _iter_c_nodes_deep_8616,
     _replace_c_children_8616,
 )
+from inertia.pipeline.errors import PipelineHardError
 from inertia.lowering.physical_registers import physical_register_view_8616
 from inertia.semantics.expression_analysis import (
     VirtualValueIdentityKind8616,
@@ -73,6 +74,7 @@ __all__ = [
     "runtime_gp_state_expr_8616",
     "runtime_gp_state_names_8616",
     "runtime_gp_state_symbols_8616",
+    "snapshot_exit_lane_reads_8616",
 ]
 
 _ENTRY_STATEMENT_PHASES: cython.longlong = 2
@@ -1178,6 +1180,123 @@ def _drop_shadowed_unified_locals_8616(
     return changed
 
 
+def _is_gp_exit_publication_8616(statement: object) -> cython.bint:
+    """Return whether the statement is one architectural GP exit publication."""
+    return isinstance(statement, structured_c.CAssignment) and "inertia_gp_exit_coordinate" in statement.tags
+
+
+def _exit_assignment_lane_8616(assignment: structured_c.CAssignment) -> object:
+    """Return the runtime GP parent an exit publication writes, or None."""
+    return runtime_gp_name_for_variable_8616(
+        next(
+            (
+                node.variable
+                for node in builtins.iter(_iter_c_nodes_deep_8616(assignment.lhs))
+                if isinstance(node, structured_c.CVariable)
+                and runtime_gp_name_for_variable_8616(node.variable) is not None
+            ),
+            None,
+        )
+    )
+
+
+def _exit_lane_reads_8616(
+    assignment: structured_c.CAssignment, lane: object,
+) -> list[structured_c.CVariable]:
+    """Collect value reads of one runtime lane; the write's own parent-mask read is excluded."""
+    return [
+        node for node in builtins.iter(_iter_c_nodes_deep_8616(assignment.rhs))
+        if isinstance(node, structured_c.CVariable)
+        and not node.tags.get("inertia_gp_exit_only")
+        and runtime_gp_name_for_variable_8616(node.variable) == lane
+    ]
+
+
+def snapshot_exit_lane_reads_8616(codegen: object) -> cython.bint:
+    """Make sequential architectural GP exit publications a parallel copy.
+
+    An exit value read from a runtime lane that an earlier exit publication of
+    the same run already wrote observes the new value, not the pre-exit one.
+    Snapshot the lane immediately before its first exit write and read the
+    snapshot. A hazard whose write and read are not contiguous exit
+    publications cannot be proven pre-exit and is refused.
+    """
+    boundary = cast(_CodegenGPRegisters8616, codegen)
+    function = boundary.cfunc
+    if function is None:
+        return False
+    # Dynamic angr boundary: the C function exposes its variable inventory.
+    variables_in_use = cast(MutableMapping[object, object], getattr(function, "variables_in_use"))
+    changed = False
+    used_ids = {
+        node.variable.tmp_id for node in builtins.iter(_iter_c_nodes_deep_8616(function.statements))
+        if isinstance(node, structured_c.CVariable) and isinstance(node.variable, SimTemporaryVariable)
+    }
+    used_ids.update(
+        variable.tmp_id for variable in builtins.iter(variables_in_use) if isinstance(variable, SimTemporaryVariable)
+    )
+    next_id = max(used_ids, default=-1) + 1
+    for group in tuple(
+        node for node in builtins.iter(_iter_c_nodes_deep_8616(function.statements))
+        if isinstance(node, structured_c.CStatements)
+    ):
+        statements = list(group.statements)
+        first_write: dict[object, cython.longlong] = {}
+        snapshots: dict[object, structured_c.CVariable] = {}
+        inserts: list[tuple[cython.longlong, structured_c.CAssignment]] = []
+        for index, statement in builtins.iter(enumerate(statements)):
+            if not _is_gp_exit_publication_8616(statement):
+                # A non-exit statement ends the contiguous run: earlier writes no longer snapshot here.
+                for lane in tuple(first_write):
+                    if any(
+                        _exit_lane_reads_8616(later, lane)
+                        for later in builtins.iter(statements[index:])
+                        if _is_gp_exit_publication_8616(later)
+                    ):
+                        raise PipelineHardError(
+                            f"GP exit function={function.addr:#x}: lane {lane} is read after a non-contiguous exit write"
+                        )
+                first_write.clear()
+                continue
+            for lane, write_index in builtins.iter(tuple(first_write.items())):
+                reads = _exit_lane_reads_8616(statement, lane)
+                if not reads:
+                    continue
+                snapshot = snapshots.get(lane)
+                if snapshot is None:
+                    temporary = SimTemporaryVariable(next_id, 4)
+                    next_id += 1
+                    lane_type = _runtime_gp_lane_type_8616(codegen)
+                    snapshot = structured_c.CVariable(temporary, variable_type=lane_type, codegen=codegen)
+                    variables_in_use[temporary] = snapshot
+                    function.variable_manager.set_variable_type(temporary, lane_type)
+                    snapshots[lane] = snapshot
+                    source = cast(
+                        structured_c.CExpression,
+                        runtime_gp_state_expr_8616(
+                            _RUNTIME_GP_STATE_SYMBOLS_8616[lane].removeprefix("inertia_"),
+                            codegen=codegen, function_addr=function.addr,
+                        ),
+                    )
+                    inserts.append((write_index, structured_c.CAssignment(snapshot, source, codegen=codegen)))
+                for read in reads:
+                    _replace_c_children_8616(
+                        statement.rhs,
+                        lambda node, target=read, value=snapshot: value if node is target else node,
+                    )
+                    if statement.rhs is read:
+                        statement.rhs = snapshot
+                changed = True
+            lane = _exit_assignment_lane_8616(statement)
+            if lane is not None:
+                first_write.setdefault(lane, index)
+        if inserts:
+            for write_index, assignment in builtins.iter(sorted(inserts, key=operator.itemgetter(0), reverse=True)):
+                statements.insert(write_index, assignment)
+            group.statements = statements
+    return changed
+
+
 def lower_architectural_gp_register_state_8616(codegen: object) -> cython.bint:
     """Materialize SSA-proven GP live-ins as explicit runtime globals.
 
@@ -1233,6 +1352,8 @@ def lower_architectural_gp_register_state_8616(codegen: object) -> cython.bint:
     if _replace_c_children_8616(cfunc.statements, transform):
         changed = True
     if _drop_shadowed_unified_locals_8616(cfunc, project, state_owned_names):
+        changed = True
+    if snapshot_exit_lane_reads_8616(codegen):
         changed = True
     classified = len(ctx.materialized_ids)
     boundary._inertia_gp_register_state_lowering_stats_8616 = GPRegisterStateLoweringStats8616(
