@@ -59,4 +59,6 @@ def machine_bp_stack_object_name_8616(offset: cython.longlong, *, codegen: objec
             bp_offset = machine_bp_offset_for_stack_variable_8616(codegen, variable)
             if bp_offset == offset:
                 return f"arg_{offset:x}"
-    return f"local_{abs(offset):x}"
+    if offset > 0:
+        return f"frame_pos_{offset:x}"
+    return f"local_{-offset:x}"

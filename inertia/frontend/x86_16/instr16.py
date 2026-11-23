@@ -716,6 +716,8 @@ class Instr16(InstrBase):
 
     def _load_far_pointer(self) -> tuple[object, object]:
         """Load the decoded far pointer through segmented operand helpers."""
+        if self.instr.modrm.mod == 3:
+            raise ValueError("far pointer operand requires a memory encoding")
         seg, addr = self._resolved_rm_address()
         result = load_far_pointer(self.emu, seg, addr, 16, address_bits=self.effective_address_bits())
         return result[0], result[1]

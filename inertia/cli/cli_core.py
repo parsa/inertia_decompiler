@@ -7987,7 +7987,16 @@ class _DirectAddrCliRun8616:
             self.args.addr = self.direct_addr
             if self.function_label is None and self.canonical_direct_addr.name:
                 self.function_label = self.canonical_direct_addr.name
+        timing = os.environ.get("INERTIA_DEBUG_TIMING") == "1"
+        if timing:
+            started = time.monotonic()
+            print("[dbg] stage-time: discovery:direct_cfg start", flush=True)
         _rc = self._phase_direct_cfg_recovery_8616()
+        if timing:
+            print(
+                f"[dbg] stage-time: discovery:direct_cfg done elapsed={time.monotonic() - started:.3f}s",
+                flush=True,
+            )
         if _rc is not None:
             return _rc
         if self.project.arch.name == "86_16":

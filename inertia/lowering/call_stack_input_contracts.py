@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 
 from angr.analyses.decompiler.structured_codegen import c
-from angr.sim_type import SimType, SimTypeArray, SimTypeBottom, SimTypeFunction, SimTypePointer
+from angr.sim_type import SimType, SimTypeArray, SimTypeBottom, SimTypeFunction, SimTypeInt, SimTypePointer
 from angr.sim_variable import SimTemporaryVariable
 from archinfo import Arch
 
@@ -155,12 +155,20 @@ class CallStackInputBinding8616:
 def call_stack_argument_is_stable_8616(expression: object) -> cython.bint:
     """Admit transparent argument expressions evaluated once before frame setup.
 
-    Opaque operations, nested calls and assignment expressions refuse. This
-    does not infer purity from a callee name or rendered expression.
+    Opaque operations, machine calls and assignment expressions refuse. An
+    owned segmented-read helper is evaluated once before the frame write;
+    its operands still pass the same checks. A callee name alone is insufficient.
     """
     node: object
     allowed = (c.CConstant, c.CVariable, c.CBinaryOp, c.CUnaryOp, c.CTypeCast, c.CIndexedVariable)
     for node in _iter_c_nodes_deep_8616(expression):
+        if (
+            isinstance(node, c.CFunctionCall) and node.callee_func is None
+            and node.args is not None and len(node.args) == 2
+            and node.callee_target in ("SEG_U8", "SEG_U16", "SEG_U32")
+            and node.tags.get("inertia_x86_16_runtime_segment_helper") == node.callee_target
+        ):
+            continue
         if not isinstance(node, allowed):
             return False
         if isinstance(node, c.CUnaryOp) and node.op not in {"Neg", "Not", "Reference", "Dereference"}:
@@ -235,7 +243,7 @@ class CallStackContextLayout8616:
     call: c.CFunctionCall
     original_arguments: object
     pre_write: c.CAssignment
-    post_write: c.CAssignment
+    post_write: c.CAssignment | None
 
 
 @cython.ccall
@@ -257,9 +265,27 @@ def _layout_call(wrapper: c.CMultiStatementExpression, marker: CallStackInputBin
         return None
     if not call_stack_temporary_8616(invoked.lhs, marker.result_tmp_id) or not call_stack_temporary_8616(wrapper.expr, marker.result_tmp_id):
         return None
-    if operator.ne(invoked.lhs.type, call.type) or operator.ne(wrapper.expr.type, call.type):
+    if (not _same_value_representation_8616(invoked.lhs.type, call.type)
+            or not _same_value_representation_8616(wrapper.expr.type, call.type)):
         return None
     return call
+
+
+@cython.ccall
+def _same_value_representation_8616(left: object, right: object) -> cython.bint:
+    """Equal types, or integer types with one bit width and signedness.
+
+    Later type normalization may respell a 16-bit ``unsigned int`` call result
+    as ``unsigned short``; both denote the identical value representation.
+    """
+    if operator.eq(left, right):
+        return True
+    if not isinstance(left, SimTypeInt) or not isinstance(right, SimTypeInt):
+        return False
+    try:
+        return bool(operator.eq(left.size, right.size) and operator.eq(left.signed, right.signed))
+    except (ValueError, NotImplementedError):
+        return False
 
 
 @cython.ccall
@@ -312,10 +338,14 @@ def call_stack_context_layout_8616(
         identities = (*identities, marker.result_tmp_id)
     count = len(marker.argument_tmp_ids)
     statements = list(wrapper.stmts.statements)
-    if operator.ne(len(set(identities)), len(identities)) or operator.ne(len(statements), count + 3):
+    position = marker.position
+    if position is None:
         return None
-    pre, post = statements[count], statements[-1]
-    if not isinstance(pre, c.CAssignment) or not isinstance(post, c.CAssignment):
+    returning = position.caller_after_offset is not None
+    if operator.ne(len(set(identities)), len(identities)) or operator.ne(len(statements), count + (3 if returning else 2)):
+        return None
+    pre, post = statements[count], statements[-1] if returning else None
+    if not isinstance(pre, c.CAssignment) or (returning and not isinstance(post, c.CAssignment)):
         return None
     call = _layout_call(wrapper, marker, statements[count + 1])
     if call is None:

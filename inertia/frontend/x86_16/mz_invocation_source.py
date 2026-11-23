@@ -12,6 +12,9 @@ separate obligations for consumers.
 from __future__ import annotations
 import typing
 import cython
+import angr
+
+from .load_dos_mz import DOSMZ
 
 import hashlib
 from dataclasses import dataclass
@@ -125,3 +128,24 @@ def mz_invocation_source_8616(source: object, load_segment: cython.longlong) -> 
         source, load_segment, module, coordinates.entry_segment, coordinates.entry_offset,
         coordinates.stack_segment, coordinates.stack_offset, exe.minalloc, exe.maxalloc,
     )
+
+
+def authenticate_loaded_mz_boot_8616(
+    project: angr.Project, source: bytes,
+) -> MzInvocationSource8616 | None:
+    """Bind source-derived boot coordinates to the current mapped DOS image."""
+    main = project.loader.main_object
+    if not isinstance(main, DOSMZ):
+        return None
+    try:
+        boot = mz_invocation_source_8616(source, main.mz_load_segment)
+        live = bytes(project.loader.memory.load(boot.module_base, len(boot.module)))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if live != boot.module or boot.entry_linear != main.entry or boot.entry_linear != project.entry:
+        return None
+    expected = dict(cs=boot.entry_segment, ip=boot.entry_offset,
+                    ss=boot.stack_segment, sp=boot.stack_offset)
+    if any(main.initial_register_values.get(reg) != value for reg, value in expected.items()):
+        return None
+    return boot

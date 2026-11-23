@@ -17,6 +17,8 @@ import cython
 from dataclasses import dataclass
 from enum import StrEnum
 
+from contextvars import ContextVar
+
 from inertia.ir.ir_boundary_cfg import IRBoundaryCoverageResult8616
 
 from .bp_preservation import _return_blocks_8616
@@ -42,6 +44,115 @@ def _word_delta_8616(value: cython.longlong) -> cython.longlong:
     return ((value + 0x8000) & 0xFFFF) - 0x8000
 
 
+_NESTED_CALL_MAX_DEPTH_8616 = 8
+_NESTED_CALL_ACTIVE_8616: ContextVar[tuple[int, ...]] = ContextVar(
+    "_NESTED_CALL_ACTIVE_8616", default=(),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class NestedCallStackTransfer8616:
+    """Proven caller-visible SP delta of one nested CALL, with BP preservation."""
+
+    sp_delta: int
+    bp_preserved: bool
+
+
+def _nested_call_deltas_8616(coverage: IRBoundaryCoverageResult8616) -> dict[int, int] | None:
+    """Prove each nested direct CALL's caller-visible SP transfer, recursively.
+
+    A CALL row already carrying its own proven effect keeps it (the solver
+    authenticates that record). Otherwise the row must be a direct E8/9A
+    call whose target binding and whole callee body are proven by the same
+    Semantics owner used for top-level calls; the caller-visible transfer is
+    ``callee entry->after RET`` minus the machine frame the CALL pushed.
+    Cycles and depth beyond the bound refuse (``None``) instead of recursing.
+    """
+    from inertia.semantics.bp_call_preservation import prove_direct_bp_call_preservation_8616
+    from inertia.semantics.callee_stack_effects import prove_direct_callee_stack_effect_8616
+    from inertia.semantics.callsite_summary import CallsiteMachineFrameKind8616
+
+    artifact = coverage.artifact
+    project = getattr(coverage.boundary, "project", None)
+    deltas: dict[int, int] = {}
+    rows = [row for block in iter(artifact.blocks) for row in iter(block.instrs) if row.op == "CALL"]
+    if not rows:
+        return deltas
+    active = _NESTED_CALL_ACTIVE_8616.get()
+    if project is None or artifact.function_addr in active or len(active) >= _NESTED_CALL_MAX_DEPTH_8616:
+        return None
+    token = _NESTED_CALL_ACTIVE_8616.set(active + (artifact.function_addr,))
+    try:
+        for row in rows:
+            if _nested_call_effect_bound_8616(row):
+                continue
+            if type(row.addr) is not int:
+                return None
+            # The CALL row is the instruction's own decoded head; its machine
+            # encoding is re-read from the image (the row size may be elided).
+            encoding = bytes(project.loader.memory.load(row.addr, 5))
+            if len(encoding) == 5 and encoding[0] == 0xE8:
+                frame, length = CallsiteMachineFrameKind8616.NEAR, 3
+                target_addr = row.addr + 3 + int.from_bytes(encoding[1:3], "little", signed=True)
+            elif len(encoding) == 5 and encoding[0] == 0x9A:
+                frame, length = CallsiteMachineFrameKind8616.FAR, 5
+                target_addr = (int.from_bytes(encoding[3:5], "little") << 4) + int.from_bytes(encoding[1:3], "little")
+            else:
+                return None
+            if row.size not in (0, length):
+                return None
+            # Decoded coordinates only; prove_direct_callee_stack_effect_8616
+            # still requires the target binding (selector window) to hold.
+            result = prove_direct_callee_stack_effect_8616(
+                project, row.addr, row.addr + length, target_addr, frame,
+            )
+            returned = result.return_sp_delta
+            if returned is None:
+                return None
+            bp_proof = prove_direct_bp_call_preservation_8616(
+                project, row.addr, row.addr + length, target_addr, frame,
+            )
+            bp_preserved = bool(bp_proof.complete)
+            if not bp_preserved:
+                from inertia.ir.far_call_return_premise import saved_bp_premise_refusal_8616
+                row_addrs = {item.addr for block in iter(artifact.blocks) for item in iter(block.instrs)}
+                push_cs = (
+                    frame is CallsiteMachineFrameKind8616.NEAR
+                    and (row.addr - 1) in row_addrs
+                    and bytes(project.loader.memory.load(row.addr - 1, 1)) == b"\x0e"
+                )
+                bp_preserved = saved_bp_premise_refusal_8616(
+                    project, row.addr, target_addr,
+                    frame is CallsiteMachineFrameKind8616.FAR, push_cs,
+                ) is None
+            deltas[row.addr] = NestedCallStackTransfer8616(
+                returned - frame.return_frame_width, bp_preserved,
+            )
+    finally:
+        _NESTED_CALL_ACTIVE_8616.reset(token)
+    return deltas
+
+
+@cython.ccall
+def _nested_call_effect_bound_8616(row: object) -> cython.bint:
+    """Admit a CALL row's own record only when it carries a complete proven SP transfer.
+
+    The shared stack solver re-authenticates the coordinates against the
+    CALL row (callsite, bound target, delta agreement).
+    """
+    effect = row.call_stack_effect
+    coordinates = getattr(effect, "stack_coordinates", None)
+    return (
+        effect is not None
+        and effect.complete
+        and effect.net_stack_delta is not None
+        and coordinates is not None
+        and coordinates.has_proven_sp_delta
+        and coordinates.net_sp_delta is not None
+        and operator.eq(coordinates.net_sp_delta, effect.net_stack_delta)
+    )
+
+
 def _return_transfers_8616(
     coverage: IRBoundaryCoverageResult8616,
 ) -> tuple[CalleeStackPointerFailure8616 | None, tuple[tuple[cython.longlong, cython.longlong], ...]]:
@@ -54,13 +165,16 @@ def _return_transfers_8616(
     artifact = coverage.artifact
     if any(artifact.function_addr in block.successor_addrs for block in iter(artifact.blocks)):
         return CalleeStackPointerFailure8616.ENTRY_REENTERED, ()
-    if any(row.op in {"CALL", "INT", "INTERRUPT", "SYSCALL", "IRET"}
+    if any(row.op in {"INT", "INTERRUPT", "SYSCALL", "IRET"}
            for block in iter(artifact.blocks) for row in iter(block.instrs)):
+        return CalleeStackPointerFailure8616.EXTERNAL_EFFECT, ()
+    call_deltas = _nested_call_deltas_8616(coverage)
+    if call_deltas is None:
         return CalleeStackPointerFailure8616.EXTERNAL_EFFECT, ()
     exits = _return_blocks_8616(artifact)
     if exits is None:
         return CalleeStackPointerFailure8616.RETURN_UNPROVEN, ()
-    states = _solve_stack_states(artifact)
+    states = _solve_stack_states(artifact, call_deltas=call_deltas or None)
     transfers: list[tuple[cython.longlong, cython.longlong]] = []
     for block in sorted(exits, key=lambda item: item.addr):
         delta = states[block.addr].sp_delta

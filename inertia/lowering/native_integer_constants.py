@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-from angr.ailment.expression import BinaryOp, Const, Register, VirtualVariable, VirtualVariableCategory
+from angr.ailment.expression import BinaryOp, Const, Convert, Register, VirtualVariable, VirtualVariableCategory
 from angr.analyses.decompiler.structured_codegen.c import (
     CConstant,
     CExpression,
@@ -28,7 +28,7 @@ from angr.analyses.decompiler.structured_codegen.c import (
 )
 from angr.sim_type import SimType, SimTypeChar, SimTypeInt, SimTypeNum
 
-from .native_integer_operations import lower_native_integer_operation_8616
+from .native_integer_operations import lower_native_integer_operation_8616, lower_native_word_extension_8616
 from .semantic_cast import CSemanticCast8616
 import dataclasses
 
@@ -179,6 +179,26 @@ def apply_native_integer_constant_values_8616() -> None:
     original = CStructuredCodeGenerator._handle_Expr_BinaryOp
     if original.__name__ == "_handle_integer_constant_8616":
         return
+    original_convert = CStructuredCodeGenerator._handle_Expr_Convert
+
+    def _handle_word_extension_8616(
+        self: CStructuredCodeGenerator, expression: Convert, **kwargs: object,
+    ) -> CExpression:
+        """Keep an AIL word reduction explicit across C integer promotion."""
+        native = cast(CExpression, original_convert(self, expression, **kwargs))
+        if self.project.arch.name != "86_16":
+            return native
+        report = _report_8616(self)
+        report.raw_fact_count += 1
+        replacement = lower_native_word_extension_8616(expression, native)
+        if replacement is None:
+            return native
+        report.normalized_fact_count += 1
+        report.classified_fact_count += 1
+        report.materialized_count += 1
+        return replacement
+
+    cast(Any, CStructuredCodeGenerator)._handle_Expr_Convert = _handle_word_extension_8616
 
     def _handle_integer_constant_8616(
         self: CStructuredCodeGenerator, expression: BinaryOp, **kwargs: object,

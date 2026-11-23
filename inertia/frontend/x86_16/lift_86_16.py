@@ -160,6 +160,7 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
     instr32: Instr32 | None
     simple_semantics: object
     condition_value_semantics: object
+    captured_cmp_operands: object
     _past_instructions: Any = ()
 
     def dirty(self, ret_type: object, func_name: object, args: object) -> Any:
@@ -272,6 +273,7 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
         self.emu.set_bitstream(bitstrm)
         self.simple_semantics = None
         self.condition_value_semantics = None
+        self.captured_cmp_operands = None
         super().__init__(bitstrm, arch, addr)
 
         self.reg_offsets = self._REG_OFFSETS
@@ -691,6 +693,12 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
             return
         raise NotImplementedError(op_name)
 
+    def _emit_cmp_flags_8616(self, lhs: Any, rhs: Any, width_bits: cython.longlong = 16) -> None:
+        """Bind a following local branch to the same values consumed by FLAGS."""
+        self.captured_cmp_operands = (lhs, rhs)
+        self._record_cmp_condition_source(lhs, rhs, width_bits=width_bits)
+        self._update_binop_flags16("sub", lhs, rhs)
+
     def _flag_is_set(self, bit: cython.longlong) -> Any:
         return operator.ne((self._get_reg16("flags") & self._const16(1 << bit)), self._const16(0))
 
@@ -714,8 +722,7 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
         elif op_name == "or":
             result = dst | src
         elif op_name == "cmp":
-            self._record_cmp_condition_source(dst, src)
-            self._update_binop_flags16("sub", dst, src)
+            self._emit_cmp_flags_8616(dst, src)
             return
         else:
             raise NotImplementedError(op_name)
@@ -747,8 +754,7 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
         elif op_name == "or":
             result = dst | src
         elif op_name == "cmp":
-            self._record_cmp_condition_source(dst, src)
-            self._update_binop_flags16("sub", dst, src)
+            self._emit_cmp_flags_8616(dst, src)
             return
         else:
             raise NotImplementedError(op_name)
@@ -783,8 +789,7 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
         elif op_name == "or":
             result = dst | src
         elif op_name == "cmp":
-            self._record_cmp_condition_source(dst, src)
-            self._update_binop_flags16("sub", dst, src)
+            self._emit_cmp_flags_8616(dst, src)
             return
         else:
             raise NotImplementedError(op_name)
@@ -855,19 +860,6 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
             return dst | src
         raise NotImplementedError(op_name)
 
-    def _cmp_operands_from_semantics(self, semantics: object) -> object:
-        """Rebuild VEX operands for a previously classified CMP instruction."""
-        shape: object
-        shape = _CMP_OPERAND_SHAPES_8616.get(str(semantics[0]))
-        if shape is None:
-            return None
-        lhs_role, rhs_role, _width = shape
-        _, lhs_operand, rhs_operand = semantics
-        return (
-            _cmp_lift_operand_value_8616(self, lhs_role, lhs_operand),
-            _cmp_lift_operand_value_8616(self, rhs_role, rhs_operand),
-        )
-
     def _next_instruction_is_simple_jcc(self) -> cython.bint:
         nxt_semantics: object
         if not self._future_instructions:
@@ -895,6 +887,13 @@ class Instruction_ANY(Instruction):  # type: ignore[misc]  # dynamic pyvex base
         cfg_dead: object
         decoded: object
         instruction: object
+        # REPE/REPNE compares consume their own ZF before leaving this
+        # instruction. It may be dead at the next decoded instruction
+        # but is still required by the native repeat tail.
+        words = str(getattr(getattr(self, "cs", None), "mnemonic", "")).lower().split()
+        if (len(words) == 2 and words[0] in {"rep", "repe", "repz", "repne", "repnz"}
+                and words[1].startswith(("cmps", "scas"))):
+            written = written & ~StatusFlag8616.ZERO
         try:
             instruction_address = int(self.addr)
         except (AttributeError, TypeError, ValueError):
@@ -2372,18 +2371,6 @@ def _consume_last_condition_8616(self: Instruction_ANY, last_condition: Any, pre
         with contextlib.suppress(Exception):
             prev_emu.clear_last_condition()
 
-@cython.ccall
-def _prev_cmp_semantics_8616(self: Instruction_ANY, prev: object) -> object:
-    """Read CMP semantics from the actual preceding instruction in this IRSB.
-
-    Pending transfer evidence is keyed only by address and can belong to a
-    different image or path. It cannot replace architectural FLAGS in emitted
-    execution IR; a branch without an adjacent producer reads those flags.
-    ``prev`` is the dynamic pyvex instruction boundary.
-    """
-    prev_semantics = getattr(prev, "simple_semantics", None) if prev is not None else None
-    return cast(tuple[Any, ...] | None, prev_semantics)
-
 def _cmp_result_jcc_condition_8616(self: Instruction_ANY, kind: object, lhs: Any, rhs: Any) -> Any | None:
     """Build the per-kind comparison expression over CMP operands."""
     build: object
@@ -2407,28 +2394,22 @@ def _cmp_result_jcc_condition_8616(self: Instruction_ANY, kind: object, lhs: Any
 
 @cython.ccall
 def _resolve_jcc_condition_8616(self: Instruction_ANY, kind: object, last_condition: Any, prev: Any) -> Any | None:
-    """Resolve a direct JCC predicate from last-condition, result, or CMP evidence."""
-    branch_cond: object
-    operands: object
-    prev_semantics: object
-    result_condition: object
+    """Resolve local value predicates; otherwise consume architectural FLAGS."""
+    if prev is None or getattr(prev, "irsb_c", None) is not self.irsb_c:
+        return None
+    captured = getattr(prev, "captured_cmp_operands", None)
+    if captured is not None:
+        lhs, rhs = captured
+        return _cmp_result_jcc_condition_8616(self, kind, lhs, rhs)
     if isinstance(last_condition, IRCondition):
         branch_cond = _direct_jcc_condition_from_last_condition_8616(cast(Any, self), kind, last_condition)
         if branch_cond is not None:
             return branch_cond
-    result_condition = direct_register_result_zero_jcc_8616(
+    # A decoded CMP shape is not a captured value. Rebuilding operands here
+    # could add a memory access after the producer has already set FLAGS.
+    return direct_register_result_zero_jcc_8616(
         cast(Any, self), kind, instruction_addr=int(self.addr), previous=prev,
     )
-    if result_condition is not None:
-        return result_condition
-    prev_semantics = _prev_cmp_semantics_8616(self, prev)
-    if prev_semantics is None:
-        return None
-    operands = self._cmp_operands_from_semantics(prev_semantics)
-    if operands is None:
-        return None
-    lhs, rhs = operands
-    return _cmp_result_jcc_condition_8616(self, kind, lhs, rhs)
 
 @cython.ccall
 def _record_sub_reg_imm_condition_8616(self: Instruction_ANY, dst: Any, src: Any, dst_reg: object, imm: Any) -> None:
@@ -2936,6 +2917,24 @@ def _lift_call_8616(self: Instruction_ANY, semantics: object) -> None:
     # displacement modulo WORD, wrap architectural IP, then restore CS's
     # full loader coordinate rather than truncating the physical destination.
     next_address = self.addr + self.cs.size
+    # Opt-in selector census is conditional evidence. It changes only the
+    # fetch target when every offered selector gives the same no-wrap edge.
+    # Keep the architectural return word and physical near frame above.
+    from .opus_cs_census import census_selectors_8616
+
+    displacement = ((int(target) - next_address + 0x8000) & 0xffff) - 0x8000
+    linear_target = next_address + displacement
+    selectors = census_selectors_8616(int(self.addr))
+    target_bound = bool(selectors)
+    for selector in selectors:
+        base = selector << 4
+        if not (base <= min(self.addr, next_address, linear_target)
+                and max(self.addr, next_address, linear_target) <= base + 0xffff):
+            target_bound = False
+            break
+    if target_bound:
+        self.jump(None, self._const32(linear_target), JumpKind.Call)
+        return
     destination = relative_continuation(
         next_address, cast(CoordinateValue, self._get_reg16("cs")),
         int(target) - next_address, ControlWidth.WORD,
@@ -3230,17 +3229,6 @@ _CMP_LIFT_SHAPES_8616: Mapping[str, tuple[str, str, cython.longlong]] = {
     "cmp_reg_indexed_abs8": ("reg8", "idx8", 8),
     "cmp_indexed_abs_reg16": ("idx16", "reg16", 16),
     "cmp_reg_indexed_abs16": ("reg16", "idx16", 16),
-}
-
-_CMP_OPERAND_SHAPES_8616: Mapping[str, tuple[str, str, cython.longlong]] = {
-    **{
-        kind: shape
-        for kind, shape in builtins.iter(_CMP_LIFT_SHAPES_8616.items())
-        if kind != "cmp_reg_imm8"
-    },
-    "cmp_reg_reg16": ("reg16", "reg16", 16),
-    "cmp_reg_imm16": ("reg16", "imm16", 16),
-    "cmp_reg_mem16": ("reg16", "mem16", 16),
 }
 
 _MOV_LIFT_LOAD_ROLES_8616: Mapping[str, tuple[str, str]] = {
@@ -3790,8 +3778,7 @@ def _lift_simple_cmp_8616(self: Instruction_ANY, kind: object) -> cython.bint:
     _, lhs_operand, rhs_operand = cast(tuple[Any, Any, Any], self.simple_semantics)
     lhs_val = _cmp_lift_operand_value_8616(self, lhs_role, lhs_operand)
     rhs_val = _cmp_lift_operand_value_8616(self, rhs_role, rhs_operand)
-    self._record_cmp_condition_source(lhs_val, rhs_val, width_bits=width_bits)
-    self._update_binop_flags16("sub", lhs_val, rhs_val)
+    self._emit_cmp_flags_8616(lhs_val, rhs_val, width_bits)
     return True
 
 @cython.ccall

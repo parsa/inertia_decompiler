@@ -2760,16 +2760,33 @@ class _StructuredSimplifyRun8616:
                 return replacement
             return current
         if isinstance(current, structured_c.CUnaryOp):
-            operand = self._resolve_copy_alias_expr(current.operand, seen)
+            operand = self._resolve_copy_alias_child_8616(current.operand, seen)
             if operand is not current.operand:
                 return structured_c.CUnaryOp(current.op, operand, codegen=current.codegen)
             return current
         if isinstance(current, structured_c.CBinaryOp):
-            lhs = self._resolve_copy_alias_expr(current.lhs, seen)
-            rhs = self._resolve_copy_alias_expr(current.rhs, seen)
+            lhs = self._resolve_copy_alias_child_8616(current.lhs, seen)
+            rhs = self._resolve_copy_alias_child_8616(current.rhs, seen)
             if lhs is not current.lhs or rhs is not current.rhs:
                 return structured_c.CBinaryOp(current.op, lhs, rhs, codegen=current.codegen)
         return current
+
+    @cython.ccall
+    def _resolve_copy_alias_child_8616(self, child: StructuredAstValue, seen: object) -> StructuredAstValue:
+        """Resolve aliases below an operator while keeping the child's casts.
+
+        Operand casts carry access width and pointer scaling (for example the
+        ``(char *)`` in angr's ``*((char *)&word + 1)`` high-byte view); dropping
+        them before rebuilding the parent changes the accessed bytes.
+        """
+        if isinstance(child, structured_c.CTypeCast):
+            inner = self._resolve_copy_alias_child_8616(child.expr, seen)
+            if inner is child.expr:
+                return child
+            replacement = copy.copy(child)
+            replacement.expr = inner
+            return replacement
+        return self._resolve_copy_alias_expr(child, seen)
 
     @cython.ccall
     def _expr_is_safe_inline_candidate(self, expr: StructuredAstValue) -> StructuredAstValue:

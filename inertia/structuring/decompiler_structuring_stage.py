@@ -81,6 +81,8 @@ from inertia.lowering.call_cleanup_carriers import (
 )
 from inertia.lowering.call_return_frame_arguments import prune_exact_call_return_frame_arguments_8616
 from inertia.lowering.call_return_selectors import replay_call_return_switch_selectors_8616
+from inertia.lowering.packed_flags_state import publish_loop_packed_flags_8616
+from inertia.lowering.word_bp_frame import lower_word_bp_frame_8616
 from inertia.lowering.call_stack_input_replay import run_call_stack_input_aware_lowering_8616
 from inertia.lowering.call_stack_inputs import apply_call_stack_input_lowering_8616
 from inertia.lowering.callee_pointer_evidence import (
@@ -2004,7 +2006,8 @@ def _replay_structuring_callsite_arguments_after_regeneration_8616(
         return _replay_unbound_structuring_callsite_arguments_after_regeneration_8616(
             project, codegen, preserve_setup=preserve_setup)
 
-    return run_call_stack_input_aware_lowering_8616(codegen, consume)
+    boundary_changed = consume_terminal_far_return_boundary_carriers_8616(project, codegen)
+    return run_call_stack_input_aware_lowering_8616(codegen, consume) or boundary_changed
 
 
 @cython.ccall
@@ -2046,7 +2049,8 @@ def _materialize_structuring_callsite_stack_arguments_8616(project: AngrProjectS
         """Run source-backed argument consumers before rebinding their C context."""
         return _materialize_unbound_structuring_callsite_stack_arguments_8616(project, codegen)
 
-    return run_call_stack_input_aware_lowering_8616(codegen, consume)
+    boundary_changed = consume_terminal_far_return_boundary_carriers_8616(project, codegen)
+    return run_call_stack_input_aware_lowering_8616(codegen, consume) or boundary_changed
 
 
 @cython.ccall
@@ -3095,9 +3099,13 @@ def _lower_prepared_structuring_stack_semantics_8616(
         changed = numeric_return_lowering.changed or changed
     with _timed_owner("dead_register_carrier_prune"):
         changed = bool(prune_unread_stack_lowered_register_carriers_8616(codegen)) or changed
+    with _timed_owner("terminal_far_return_before_call_inputs"):
+        changed = bool(consume_terminal_far_return_boundary_carriers_8616(project, codegen)) or changed
     with _timed_owner("call_stack_input_lowering"):
         call_stack_input_lowering = apply_call_stack_input_lowering_8616(codegen)
     changed = bool(call_stack_input_lowering is not None and call_stack_input_lowering.changed) or changed
+    changed = publish_loop_packed_flags_8616(codegen) or changed
+    changed = lower_word_bp_frame_8616(codegen) or changed
     with _timed_owner("terminal_return_render_projection"):
         render_projection = project_terminal_return_renderability_8616(codegen)
         cast(Any, codegen)._inertia_terminal_return_render_projection_8616 = render_projection

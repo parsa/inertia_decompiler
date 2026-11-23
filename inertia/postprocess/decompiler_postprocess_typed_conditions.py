@@ -1602,6 +1602,30 @@ def _requires_comparison_polarity_proof_8616(cond: object) -> cython.bint:
     )
 
 
+def _condition_operand_reads_memory_8616(operand: object) -> bool:
+    if isinstance(operand, IRBinaryValue):
+        return _condition_operand_reads_memory_8616(operand.lhs) or _condition_operand_reads_memory_8616(operand.rhs)
+    return isinstance(operand, IRValue) and operand.space in {
+        MemSpace.CS, MemSpace.DS, MemSpace.ES, MemSpace.SS,
+    }
+
+
+def condition_replacement_would_reload_comparison_8616(cond: object, typed_cond: ConditionIR) -> bool:
+    """Check whether an address-only operand would replace an existing comparison."""
+    predicate = cond
+    while True:
+        if isinstance(predicate, CITE):
+            predicate = predicate.cond
+        elif isinstance(predicate, CUnaryOp) and predicate.op == "Not":
+            predicate = predicate.operand
+        else:
+            break
+    return (
+        isinstance(predicate, CBinaryOp)
+        and str(predicate.op).startswith("Cmp")
+        and any(_condition_operand_reads_memory_8616(operand) for operand in (typed_cond.lhs, typed_cond.rhs))
+    )
+
 @cython.ccall
 def _materialize_typed_condition_8616(
     cond: object, key: object, ctx: _TypedConditionApplyCtx8616
@@ -1612,6 +1636,10 @@ def _materialize_typed_condition_8616(
     typed_cond: object
     typed_cond = _resolve_typed_condition_for_key_8616(ctx.project, ctx.condition_index, key, cond)
     if typed_cond is None:
+        return None
+    if condition_replacement_would_reload_comparison_8616(cond, typed_cond):
+        # The structured comparison already consumes values. An address-only
+        # operand cannot prove a new read is interchangeable with those values.
         return None
     new_cond = _build_c_condition_expr(ctx.project, typed_cond, ctx.codegen)
     if new_cond is None:

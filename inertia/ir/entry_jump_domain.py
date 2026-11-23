@@ -61,7 +61,7 @@ from pyvex.errors import PyVEXError
 
 from inertia.frontend.x86_16.arch_86_16 import Arch86_16
 from inertia.frontend.x86_16.control_coordinates import ControlAddressDomain, ControlWidth
-from inertia.frontend.x86_16.relative_control_edge import DecodedRelativeEdge
+from inertia.frontend.x86_16.relative_control_edge import DecodedRelativeEdge, bounded_relative_destination
 
 from .core import (
     IRBlock,
@@ -558,6 +558,18 @@ def _writes_cs_8616(instr: IRInstr) -> cython.bint:
     )
 
 
+def _retf_exit_cs_write_8616(block: IRBlock, instr: IRInstr) -> cython.bint:
+    """A RETF's own CS pop: it is part of a successor-less RET terminal.
+
+    The write takes effect only as control leaves the function, so it cannot
+    change the selector any in-function relative transfer executes under.
+    """
+    if block.successor_addrs or not block.instrs:
+        return False
+    last = block.instrs[-1]
+    return last.op == "RET" and type(instr.addr) is int and operator.eq(instr.addr, last.addr)
+
+
 @cython.ccall
 def _word_jump_form_8616(decoded: DecodedRelativeEdge) -> cython.bint:
     """Accept only unconditional word-width jumps, derived from owned facts.
@@ -722,24 +734,13 @@ def _joint_fetch_window_8616(heads: object) -> object:
 def _window_invariant_target_8616(
     decoded: DecodedRelativeEdge, root: cython.longlong,
 ) -> int | None:
-    """Prove the decoded linear target under the joint fetch window.
-
-    The runtime taken destination under selector ``s`` is
-    ``(s << 4) + ((head - (s << 4) + size + disp) mod 2^16)``; it equals the
-    decoded loader-linear target ``next_head + disp`` for every ``s`` in the
-    joint root/jump window exactly when the target lies inside that window's
-    common reachable band. This is the closed-form content of the verified
-    parent-jump entry theorem, evaluated without trusting any receipt.
-    """
+    """Prove the taken destination across the joint root and jump fetch domain."""
     window: object
     window = _joint_fetch_window_8616((root, decoded.head))
     if window is None:
         return None
-    target: cython.longlong = decoded.next_head + decoded.displacement
     minimum, maximum = window
-    if (maximum << 4) <= target <= (minimum << 4) + _SELECTOR_MAX_8616:
-        return target
-    return None
+    return bounded_relative_destination(decoded, minimum, maximum).target
 
 
 @cython.cclass
@@ -908,7 +909,7 @@ def _instruction_gate_8616(
             f"reachable call at {instr.addr:#x} lacks a bound "
             "preservation proof",
         )
-    if _writes_cs_8616(instr):
+    if _writes_cs_8616(instr) and not _retf_exit_cs_write_8616(block, instr):
         return (
             EntryJumpDomainRefusal8616.CS_WRITE_INTERFERENCE,
             f"reachable instruction {instr.addr:#x} writes cs",
@@ -1392,7 +1393,8 @@ class _ProofRun8616:
         block: object
         instr: object
         original: object
-        if not self.call_preservations and self.near_call_scope is None:
+        premised = self._far_return_premised_calls_8616(blocks)
+        if not self.call_preservations and self.near_call_scope is None and not premised:
             return blocks
         selectors = tuple(record for record in iter(self.call_preservations)
                           if record.selector_projection is not None)
@@ -1400,6 +1402,10 @@ class _ProofRun8616:
         for original, block in zip(self.artifact.blocks, blocks, strict=True):
             instrs: list[IRInstr] = []
             for instr in block.instrs:
+                if instr.addr in premised and (instr.op == "CALL" or _writes_cs_8616(instr)):
+                    if instr.op == "CALL":
+                        instrs.extend(self._far_return_premise_substitutes_8616(instr))
+                    continue
                 if instr.op != "CALL" or any(
                     record.block is original and record.instruction is instr for record in iter(selectors)
                 ):
@@ -1430,6 +1436,40 @@ class _ProofRun8616:
                     instrs.append(instr)
             result.append(replace(block, instrs=tuple(instrs)))
         return tuple(result)
+
+    def _far_return_premised_calls_8616(self, blocks: object) -> frozenset:
+        """Far CALLs admitted under the explicit, recorded normal-return premise.
+
+        Only calls without any bound preservation record are considered; the
+        premise is opt-in and every admission is logged as conditional.
+        """
+        from .far_call_return_premise import (
+            far_call_return_premise_refusal_8616, far_return_premise_enabled_8616,
+        )
+
+        if not far_return_premise_enabled_8616() or self.project is None:
+            return frozenset()
+        bound = {record.instruction.addr for record in iter(self.call_preservations)
+                 if record.failure is None and record.instruction is not None}
+        admitted = set()
+        for block in blocks:
+            for instr in block.instrs:
+                if instr.op != "CALL" or type(instr.addr) is not int or instr.addr in bound:
+                    continue
+                if far_call_return_premise_refusal_8616(self.project, instr.addr) is None:
+                    admitted.add(instr.addr)
+        return frozenset(admitted)
+
+    def _far_return_premise_substitutes_8616(self, instr: IRInstr) -> object:
+        """CS restored by RETF under the premise; every other segment is unknown."""
+        if instr.addr not in self.bound_callsites:
+            self.bound_callsites.add(instr.addr)
+            self.ledger.record(
+                EntryJumpDomainStage8616.PATH,
+                "call_bound",
+                f"far call at {instr.addr:#x} admitted under premise far_call_normal_return",
+            )
+        return self._segment_surrogates_8616(instr, frozenset({"cs"}))
 
     @cython.ccall
     def _native_relift_8616(

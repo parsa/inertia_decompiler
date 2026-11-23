@@ -3155,6 +3155,7 @@ class _JccRewriteRun8616:
     key_decoded_plan: object = field(default_factory=dict)
     key_conflicts: object = field(default_factory=set)
     unknown_polarity_refused_keys: object = field(default_factory=set)
+    captured_predicate_keys: object = field(default_factory=set)
     raw_state_refused_keys: object = field(default_factory=set)
     consumed_wide_compare_low_branch_keys: object = field(default_factory=set)
     call_return_guard_sources: object = field(default_factory=dict)
@@ -3190,6 +3191,7 @@ class _JccRewriteRun8616:
         self.key_decoded_plan = {}
         self.key_conflicts = set()
         self.unknown_polarity_refused_keys = set()
+        self.captured_predicate_keys = set()
         self.raw_state_refused_keys = set()
         self.consumed_wide_compare_low_branch_keys = {
             key
@@ -4234,6 +4236,24 @@ class _JccRewriteRun8616:
         if resolved is None:
             return None
         narrowed_key, polarity_evidence, decoded = resolved
+        predicate = cond
+        while isinstance(predicate, CITE) or (isinstance(predicate, CUnaryOp) and predicate.op == "Not"):
+            predicate = predicate.cond if isinstance(predicate, CITE) else predicate.operand
+        if (
+            isinstance(predicate, CBinaryOp)
+            and str(predicate.op).startswith("Cmp")
+            and not _c_expr_uses_register_8616(predicate, self.flags_offset)
+            and any(
+                isinstance(node, CFunctionCall)
+                for expr in (decoded.lhs, decoded.rhs, decoded.expr)
+                if expr is not None
+                for node in _iter_c_nodes_deep_8616(expr)
+            )
+        ):
+            if debug_jcc:
+                _log.warning("[jcc-rewrite] preserved value predicate; decoded operand would execute a helper key=%r", key)
+            self.captured_predicate_keys.add(narrowed_key)
+            return None
         if self._decoded_raw_state_gate_8616(decoded, key, narrowed_key, debug_jcc):
             return None
         if bool(decoded.expr is not None):
@@ -4285,7 +4305,7 @@ class _JccRewriteRun8616:
         if not _structured_codegen_node_8616(node):
             return node
         key = _condition_tags_8616(node)
-        if isinstance(key, tuple) and key in self.unknown_polarity_refused_keys:
+        if isinstance(key, tuple) and (key in self.unknown_polarity_refused_keys or key in self.captured_predicate_keys):
             return node
 
         def _replace_nested_condition(child: object) -> object:

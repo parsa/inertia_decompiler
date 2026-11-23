@@ -1593,11 +1593,10 @@ def _function_cfg_instruction_inventory_8616(function: object) -> tuple[object, 
     return tuple(decoded_function_instructions_8616(function))
 
 
-def _callee_saved_frame_push_addresses_8616(function: object) -> object:
+def _saved_pushes_from_instruction_inventory_8616(insns):
     """Return exact prologue PUSH addresses restored by every decoded epilogue."""
     insn: object
     ret_index: object
-    insns = _function_cfg_instruction_inventory_8616(function)
     if not insns:
         return frozenset()
 
@@ -1621,6 +1620,54 @@ def _callee_saved_frame_push_addresses_8616(function: object) -> object:
     if not restored_on_all_paths:
         return frozenset()
     return _restored_push_addresses_8616(insns, restored_on_all_paths)
+
+
+def _callee_saved_frame_push_addresses_8616(function: object) -> object:
+    """Consume the ordinary census, or an opt-in native continuation census."""
+    saved = _saved_pushes_from_instruction_inventory_8616(
+        _function_cfg_instruction_inventory_8616(function),
+    )
+    if saved or os.environ.get("INERTIA_OPUS_PRINCE_STARTUP_RETURN") != "1":
+        return saved
+    from inertia.frontend.x86_16.frontend_function_boundary import mapped_entry_function_boundary_8616
+    from inertia.frontend.x86_16.opus_cs_census import census_selectors_8616
+
+    entry = _dynamic_callsite_getattr_8616(function, "addr", None)
+    project = _dynamic_callsite_getattr_8616(function, "project", None)
+    if type(entry) is not int or project is None:
+        return saved
+    selectors = census_selectors_8616(entry)
+    if len(selectors) != 1:
+        return saved
+    boundary = mapped_entry_function_boundary_8616(project, entry)
+    if boundary is None:
+        return saved
+    base = selectors[0] << 4
+    heads = {insn.address: insn for block in boundary.blocks for insn in block.instructions}
+    if any(not base <= insn.address < insn.address + insn.size <= base + 0xffff
+           or census_selectors_8616(insn.address) != selectors for insn in heads.values()):
+        return saved
+    from inertia.frontend.x86_16.relative_control_edge import DecodedRelativeEdge, decode_relative_edge
+
+    for block in boundary.blocks:
+        terminal = block.instructions[-1]
+        if terminal.mnemonic.startswith(("j", "loop")):
+            edge = decode_relative_edge(terminal.address, terminal.bytes)
+            if not isinstance(edge, DecodedRelativeEdge) or (
+                block.addr, terminal.address + terminal.size + edge.displacement
+            ) not in boundary.successor_edges:
+                return saved
+    prologue = set()
+    address = entry
+    while address in heads and heads[address].mnemonic == "push":
+        prologue.add(address)
+        address += heads[address].size
+    # This census retains the architectural CALL fallthrough even when a
+    # higher-level CFG omits it on a no-return path. Its epilogue is useful
+    # for distinguishing the prologue's saved word from outgoing arguments.
+    return _saved_pushes_from_instruction_inventory_8616(
+        tuple(heads[address] for address in sorted(heads)),
+    ) & prologue
 
 
 @cython.ccall
@@ -2154,7 +2201,23 @@ def _segmented_indirect_source_from_operand_8616(
         address_context_idx -= 1
     address_source = _register_source_from_context_8616(insns, address_context_idx, base_name)
     if address_source is None:
-        return None
+        # An adjacent PUSH [reg]; CALL reads the current address register.
+        # Its value can arrive along more than one predecessor (loop
+        # backedges included); a linear-window reaching MOV is not evidence
+        # that the register has that constant on every invocation.
+        if (
+            _mnemonic(insn) != "push"
+            or operand_idx + 1 >= len(insns)
+            or not is_x86_16_call_mnemonic_8616(_mnemonic(insns[operand_idx + 1]))
+            or base_name not in {"bx", "si", "di"}
+        ):
+            return None
+        push_addr = _instruction_address_8616(insn)
+        push_size = _instruction_size_8616(insn)
+        if (push_addr is None or push_size is None or
+                push_addr + push_size != _instruction_address_8616(insns[operand_idx + 1])):
+            return None
+        address_source = (CallsitePushSourceKind8616.REGISTER_VALUE.value, base_name)
     if disp:
         address_source = (
             CallsitePushSourceKind8616.EXPR.value,

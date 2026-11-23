@@ -1414,9 +1414,13 @@ class _PathCensusContext8616:
     #: protection uses the distinct manifest, while public replay/counts retain
     #: the original admission multiplicity.
     fetched_span_admissions: cython.longlong = 0
+    boot_block_selectors: object = field(default_factory=dict)
+    boot_far_jumps: object = field(default_factory=dict)
     #: Exact raw terminals whose current callee projection proves a return.
     #: Scoped to synchronous callee replay; never inherited by another body.
     callee_return_rows: tuple[IRInstr, ...] = ()
+    active_callee: object = None
+    active_call_frame: object = None
     accounted_work_units: cython.longlong = 0
     #: The first classified instruction row the census refused — real
     #: diagnostic evidence for the exact failing site, never a guess.
@@ -2365,6 +2369,8 @@ def _census_block_bytes_8616(
     *,
     stop_after: object,
     boundary: ExactFunctionRangeBoundary8616 | None = None,
+    boot_root=False,
+    fetch_selector: int | None = None,
 ) -> Real16InvocationFailure8616 | None:
     """Census current block bytes before adding distinct protected spans.
 
@@ -2377,7 +2383,12 @@ def _census_block_bytes_8616(
     failure: object
     address: object
     successor: object
-    window_base = ctx.selector << _SEGMENT_SHIFT_8616
+    selector = (
+        ctx.boot_block_selectors.get(block.addr, ctx.selector) if boot_root
+        else ctx.selector if fetch_selector is None else fetch_selector
+    )
+    far = ctx.boot_far_jumps.get(block.addr) if boot_root else None
+    window_base = (selector if far is None else far[1]) << _SEGMENT_SHIFT_8616
     window_end = window_base + _WORD_LIMIT_8616
     for successor in block.successor_addrs:
         if not window_base <= successor <= window_end:
@@ -2402,7 +2413,7 @@ def _census_block_bytes_8616(
         expected = {addr for addr in iter(artifact_addrs) if addr <= stop_after}
     if in_scope != expected:
         return Real16InvocationFailure8616.PATH_DECODE_MISMATCH
-    failure = _bind_census_fetched_bytes_8616(ctx, machine_addrs, in_scope)
+    failure = _bind_census_fetched_bytes_8616(ctx, machine_addrs, in_scope, selector=selector)
     if failure is not None:
         return failure
     ctx.manifest.update(
@@ -2418,6 +2429,7 @@ def _census_block_bytes_8616(
 def _bind_census_fetched_bytes_8616(
     ctx: _PathCensusContext8616,
     machine: object, in_scope: object,
+    *, selector=None,
 ) -> Real16InvocationFailure8616 | None:
     """Protect every fetched body from declared data, including descendants.
 
@@ -2439,7 +2451,7 @@ def _bind_census_fetched_bytes_8616(
     span: object
     extent = _FetchedByteExtent8616()
     failure = _bind_fetched_bytes_8616(
-        machine, in_scope, selector=ctx.selector, image=ctx.image, project=ctx.project,
+        machine, in_scope, selector=ctx.selector if selector is None else selector, image=ctx.image, project=ctx.project,
         fetched_extent=extent,
     )
     if failure is not None:
@@ -3110,12 +3122,18 @@ def _simulate_census_tmp_write_8616(
     if instruction.op != "LOAD":
         _simulate_tmp_write_8616(instruction, dst, registers, tmps)
         return
-    value = path_load_value_8616(
-        instruction,
-        _store_span_8616(instruction, instruction.args[0] if instruction.args else None,
-                         instruction_entry, dirty, tmps),
-        memory, ctx.initial_memory,
-    )
+    address = instruction.args[0] if instruction.args else None
+    span = _store_span_8616(instruction, address, instruction_entry, dirty, tmps)
+    value = path_load_value_8616(instruction, span, memory, ctx.initial_memory)
+    if value is None and ctx.active_call_frame is not None and span is not None:
+        encoded = ctx.machine_bytes.get(instruction.addr)
+        frame = ctx.active_call_frame
+        if (type(address) is IRAddress and address.space is MemSpace.SS
+                and instruction_entry.get("ss") == frame.ss
+                and instruction_entry.get("sp") == frame.sp
+                and isinstance(encoded, bytes) and encoded
+                and encoded[0] in ((0xcb, 0xca) if frame.far else (0xc3, 0xc2))):
+            value = frame.read_saved_span(span, memory)
     if type(dst.source_tmp) is int:
         if value is None:
             tmps.pop(dst.source_tmp, None)
@@ -3125,6 +3143,7 @@ def _simulate_census_tmp_write_8616(
 
 def _transfer_row_failure_8616(
     ctx: _PathCensusContext8616,
+    artifact: IRFunctionArtifact,
     instruction: IRInstr,
     block: IRBlock,
     registers: object,
@@ -3147,6 +3166,21 @@ def _transfer_row_failure_8616(
         return Real16InvocationFailure8616.PATH_EFFECT_UNPROVEN
     if operator.eq(instruction.addr, ctx.callsite_addr):
         return None
+    far = (
+        ctx.boot_far_jumps.get(block.addr)
+        if type(ctx.chain) is RawBootEntrySurface8616 and ctx.chain.artifact is artifact
+        else None
+    )
+    if far is not None and instruction.addr == far[0]:
+        encoded = ctx.machine_bytes.get(instruction.addr)
+        if not isinstance(encoded, bytes) or len(encoded) != 5 or encoded[0] != 0xEA:
+            return Real16InvocationFailure8616.CS_PATH_UNPROVEN
+        ip = int.from_bytes(encoded[1:3], "little")
+        target = ((far[1] << 4) + ip) & 0xfffff
+        if (instruction.op != "JMP" or len(instruction.args) != 1
+                or registers.get("cs") != far[1] or registers.get("ip") != ip
+                or _eval_atom_8616(instruction.args[0], registers, tmps) != target):
+            return Real16InvocationFailure8616.CS_PATH_UNPROVEN
     if any(instruction is row for row in iter(ctx.callee_return_rows)):
         # Native binding still precedes transfer. The scoped projection,
         # authenticated at callee entry, owns this JMP-to-RET interpretation.
@@ -3194,6 +3228,34 @@ def _simulate_instruction_8616(
     op = instruction.op
     if _writes_segment_register_8616(instruction, "cs"):
         failure = Real16InvocationFailure8616.CS_PATH_UNPROVEN
+        # Only a terminal immediate far CALL can change CS in this census.
+        # Its post-push state is consumed by the callee, never a continuation.
+        encoded = ctx.machine_bytes.get(instruction.addr)
+        dst = instruction.dst
+        far_jump = (ctx.boot_far_jumps.get(block.addr) if
+                    type(ctx.chain) is RawBootEntrySurface8616 and ctx.chain.artifact is artifact else None)
+        if (
+            isinstance(encoded, bytes) and len(encoded) == 5
+            and (((operator.eq(instruction.addr, ctx.callsite_addr)
+                   or _active_nested_dependency_8616(ctx, artifact, instruction.addr) is not None
+                   or any(proof.caller.artifact is artifact and proof.callsite_addr == instruction.addr
+                          for proof in iter(ctx.call_preservations)))
+                  and encoded[0] == 0x9A)
+                 or (far_jump is not None and instruction.addr == far_jump[0]
+                     and encoded[0] == 0xEA))
+            and isinstance(dst, IRValue) and dst.size == 2
+            and op == "MOV" and len(instruction.args) == 1
+            and _eval_atom_8616(instruction.args[0], registers, tmps)
+            == int.from_bytes(encoded[3:5], "little")
+        ):
+            failure = _simulate_reg_write_8616(instruction, dst, registers, tmps, dirty)
+        elif (ctx.active_call_frame is not None and ctx.active_call_frame.far
+              and isinstance(encoded, bytes) and encoded
+              and (encoded == b"\xcb" or len(encoded) == 3 and encoded[0] == 0xCA)
+              and isinstance(dst, IRValue) and dst.size == 2 and op == "MOV"
+              and len(instruction.args) == 1
+              and _eval_atom_8616(instruction.args[0], registers, tmps) == ctx.active_call_frame.caller_cs):
+            failure = _simulate_reg_write_8616(instruction, dst, registers, tmps, dirty)
     elif op == "STORE":
         failure = _census_store_8616(
             ctx, instruction, instruction_entry, dirty, tmps, memory
@@ -3207,7 +3269,7 @@ def _simulate_instruction_8616(
             )
         )
     elif op in ("CJMP", "JMP", "RET"):
-        failure = _transfer_row_failure_8616(ctx, instruction, block, registers, tmps)
+        failure = _transfer_row_failure_8616(ctx, artifact, instruction, block, registers, tmps)
     else:
         # Every other effect must be closed by the authoritative scalar
         # classifier before any destination is accepted: an UNKNOWN kind,
@@ -4600,12 +4662,18 @@ def _cross_call_8616(
         # A native interrupt has a separate source-bound declared effect.
         # Consume its frame, memory and register evidence in callee walks too;
         # ordinary nested calls still need a separate callee-write proof.
-        return (
-            _declared_service_crossing_8616(ctx, artifact, instruction, registers, memory)
-            if interrupt_call_vector_8616(instruction) is not None
-            else Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
-        )
+        if interrupt_call_vector_8616(instruction) is not None:
+            return _declared_service_crossing_8616(ctx, artifact, instruction, registers, memory)
+        return _cross_nested_call_8616(ctx, artifact, instruction, registers, memory)
     if operator.eq(instruction.addr, ctx.callsite_addr):
+        encoded = ctx.machine_bytes.get(instruction.addr)
+        if isinstance(encoded, bytes) and len(encoded) == 5 and encoded[0] == 0x9A:
+            callee_ip = int.from_bytes(encoded[1:3], "little")
+            target = ((int.from_bytes(encoded[3:5], "little") << 4) + callee_ip) & 0xFFFFF
+            if registers.get("ip") != callee_ip or not _far_entry_capture_bound_8616(
+                ctx.project, instruction.addr, target, ctx.boot_block_selectors.get(block.addr, ctx.selector), registers, memory,
+            ):
+                return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
         # The proven callsite: its own stack push was already censused as a
         # STORE row. The register and memory state at this row — after that
         # machine instruction's push effects — is the callee's exact entry
@@ -4625,6 +4693,14 @@ def _cross_call_8616(
             ctx, artifact, instruction, registers, memory
         )
     proof = consumed.proof
+    encoded = ctx.machine_bytes.get(instruction.addr)
+    if type(proof) is SegmentCallPreservationResult8616 and isinstance(encoded, bytes) and len(encoded) == 5 and encoded[0] == 0x9a:
+        if not proof.complete_for(consumed.scope):
+            return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+        selector = ctx.boot_block_selectors.get(block.addr, ctx.selector)
+        return _cross_matched_direct_call_8616(
+            ctx, proof, consumed.scope, instruction.addr, selector, encoded, registers, memory,
+        )
     if (
         consumed.preserved_registers is None
         or "cs" not in consumed.preserved_registers
@@ -4647,17 +4723,27 @@ def _cross_call_8616(
     window_base = ctx.selector << _SEGMENT_SHIFT_8616
     if not window_base <= callee_addr <= window_base + _WORD_LIMIT_8616:
         return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+    frame = None
+    if callee.callsite_addrs:
+        frame = _nested_callee_frame_8616(ctx, block, instruction, callee_addr, registers, memory)
+        if frame is None:
+            return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
     callee_exits = _simulate_callee_8616(
-        ctx, proof, _PathState8616(dict(registers), memory.copy())
+        ctx, proof, _PathState8616(dict(registers), memory.copy()), frame=frame,
     )
     if isinstance(callee_exits, Real16InvocationFailure8616):
         return callee_exits
+    if frame is not None and not _nested_call_exits_match_8616(ctx, callee, frame, callee_exits):
+        return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
     failure = _reconcile_call_exit_8616(
         proof, preserved_scope, callee, callee_exits, registers, memory,
         selector_scope=consumed.selector_scope,
     )
-    if failure is None and ctx.prefix_capture_requested:
-        _record_prefix_call_8616(ctx, artifact, block, instruction, consumed)
+    if failure is None:
+        if frame is not None:
+            registers["cs"] = frame.caller_cs
+        if ctx.prefix_capture_requested:
+            _record_prefix_call_8616(ctx, artifact, block, instruction, consumed)
     return failure
 
 
@@ -4715,6 +4801,7 @@ def _reconcile_call_exit_8616(
     registers: object,
     memory: PathMemory8616,
     *, selector_scope: DeclaredSegmentInvariant | None = None,
+    matched_far_frame: bool = False,
 ) -> Real16InvocationFailure8616 | None:
     """Reauthenticate after simulation before transporting any callee effects."""
     width: object
@@ -4727,8 +4814,10 @@ def _reconcile_call_exit_8616(
         selector_record = proof
         preserved = set(selector_record.preserved_registers_for_selector(selector_scope))
     else:
+        if matched_far_frame and not proof.complete_for(scope):
+            return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
         preserved = set(proof.preserved_registers_for(scope))
-    if "cs" not in preserved:
+    if "cs" not in preserved and not matched_far_frame:
         return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
     for name in tuple(registers):
         if name not in preserved:
@@ -4857,8 +4946,11 @@ def _callee_selected_native_blocks_8616(
 def _census_callee_bytes_8616(
     ctx: _PathCensusContext8616,
     proof: _BoundaryProof8616,
+    *,
+    fetch_selector: int | None = None,
+    active: tuple[int, ...] = (),
 ) -> Real16InvocationFailure8616 | None:
-    """Append a complete leaf callee's fetched bytes to the manifest.
+    """Append a complete callee closure's fetched bytes to the manifest.
 
     Byte census is seed-independent, so it runs once per callee identity
     before path simulation: caller stores that execute before a call are
@@ -4878,8 +4970,14 @@ def _census_callee_bytes_8616(
     if not isinstance(artifact, IRFunctionArtifact):
         return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
     callee_addr = artifact.function_addr
-    if callee_addr in ctx.censused_callees:
+    if callee_addr in active or len(active) >= 16:
+        return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
+    selector = ctx.selector if fetch_selector is None else fetch_selector
+    key = (callee_addr, id(artifact), selector)
+    if key in ctx.censused_callees:
         return None
+    if any(entry[0] == callee_addr and entry[1] != id(artifact) for entry in ctx.censused_callees):
+        return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
     selected_blocks = _callee_selected_native_blocks_8616(callee, artifact)
     if isinstance(selected_blocks, Real16InvocationFailure8616):
         return selected_blocks
@@ -4899,11 +4997,201 @@ def _census_callee_bytes_8616(
     for block in sorted(artifact.blocks, key=lambda entry: entry.addr):
         failure = _census_block_bytes_8616(
             ctx, block, stop_after=None, boundary=callee.coverage.boundary,
+            fetch_selector=selector,
         )
         if failure is not None:
             return failure
-    ctx.censused_callees.add(callee_addr)
+    if callee.callsite_addrs:
+        dependencies = {}
+        for dependency in callee.state.call_preservations:
+            if (type(dependency) is not SegmentCallPreservationResult8616
+                or dependency.caller.artifact is not artifact
+                or dependency.callsite_addr in dependencies):
+                return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
+            dependencies[dependency.callsite_addr] = dependency
+        if dependencies.keys() != set(callee.callsite_addrs):
+            return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
+        for site, dependency in sorted(dependencies.items()):
+            child = dependency.callee.coverage.artifact
+            encoded = ctx.machine_bytes.get(site)
+            if not isinstance(child, IRFunctionArtifact) or not isinstance(encoded, bytes):
+                return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
+            target = _nested_direct_call_fetch_8616(site, selector, encoded)
+            if target is None or target[1] != child.function_addr:
+                return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+            failure = _census_callee_bytes_8616(
+                ctx, dependency, fetch_selector=target[0], active=(*active, callee_addr),
+            )
+            if failure is not None:
+                return failure
+    ctx.censused_callees.add(key)
     return None
+
+
+def _nested_direct_call_fetch_8616(site: int, selector: int, encoded: bytes) -> tuple[int, int] | None:
+    """Select the child's fetch segment from supported CALL bytes."""
+    offset = site - (selector << 4)
+    if not 0 <= offset <= 0x10000 - len(encoded):
+        return None
+    if len(encoded) == 3 and encoded[0] == 0xE8:
+        ip = (offset + 3 + int.from_bytes(encoded[1:], "little", signed=True)) & 0xFFFF
+    elif len(encoded) == 5 and encoded[0] == 0x9A:
+        ip = int.from_bytes(encoded[1:3], "little")
+        selector = int.from_bytes(encoded[3:], "little")
+    else:
+        return None
+    return selector, (selector << 4) + ip
+
+
+@dataclasses.dataclass(frozen=True)
+class _NestedCallFrame8616:
+    caller_cs: int
+    return_ip: int
+    ss: int
+    sp: int
+    far: bool
+
+    def read_saved_span(self, span, memory: PathMemory8616) -> int | None:
+        """Read only still-matching bytes written by the authenticated CALL."""
+        base, size = span
+        if size not in (1, 2) or not self.matches_memory(memory):
+            return None
+        saved = {
+            ((self.ss << 4) + ((self.sp + i) & 0xffff)) & 0xfffff
+            for i in range(4 if self.far else 2)
+        }
+        if not all(base + i in saved for i in range(size)):
+            return None
+        return sum(memory.known[base + i] << (8 * i) for i in range(size))
+
+    def matches_memory(self, memory: PathMemory8616) -> bool:
+        if memory.tainted:
+            return False
+        words = (self.return_ip, self.caller_cs) if self.far else (self.return_ip,)
+        for i, word in enumerate(words):
+            for j in range(2):
+                address = ((self.ss << 4) + ((self.sp + 2 * i + j) & 0xFFFF)) & 0xFFFFF
+                if address in memory.unknown or memory.known.get(address) != ((word >> (8 * j)) & 0xFF):
+                    return False
+        return True
+
+    def matches_return(self, encoded: bytes, registers, memory: PathMemory8616) -> bool:
+        """Check a decoded word RET's post-state without assuming cleanup."""
+        plain, immediate = (0xCB, 0xCA) if self.far else (0xC3, 0xC2)
+        if encoded == bytes((plain,)):
+            cleanup = 0
+        elif len(encoded) == 3 and encoded[0] == immediate:
+            cleanup = int.from_bytes(encoded[1:], "little")
+        else:
+            return False
+        width = 4 if self.far else 2
+        return (
+            self.matches_memory(memory)
+            and registers.get("ss") == self.ss
+            and registers.get("cs") == self.caller_cs
+            and registers.get("ip") == self.return_ip
+            and registers.get("sp") == (self.sp + width + cleanup) & 0xFFFF
+        )
+
+
+def _nested_direct_call_frame_8616(site, caller_cs, encoded, registers, memory):
+    """Bind post-CALL entry state and saved bytes to one physical call."""
+    if type(caller_cs) is not int or not 0 <= caller_cs <= 0xFFFF:
+        return None
+    target = _nested_direct_call_fetch_8616(site, caller_cs, encoded)
+    if target is None:
+        return None
+    callee_cs, addr = target
+    ss, sp = (registers.get(name) for name in ("ss", "sp"))
+    if (
+        any(type(word) is not int or not 0 <= word <= 0xFFFF for word in (ss, sp))
+        or registers.get("cs") != callee_cs or registers.get("ip") != addr - (callee_cs << 4)
+    ):
+        return None
+    frame = _NestedCallFrame8616(caller_cs, (site + len(encoded) - (caller_cs << 4)) & 0xFFFF,
+                                 ss, sp, encoded[0] == 0x9A)
+    return frame if frame.matches_memory(memory) else None
+
+
+def _nested_call_exits_match_8616(ctx, callee, frame, exits) -> bool:
+    """Require every retained return to consume the same saved frame."""
+    if not callee.return_block_addrs:
+        return False
+    blocks = {block.addr: block for block in callee.coverage.artifact.blocks}
+    for address in callee.return_block_addrs:
+        block = blocks.get(address)
+        state = exits.get(address)
+        if block is None or not block.instrs or state is None:
+            return False
+        encoded = ctx.machine_bytes.get(block.instrs[-1].addr)
+        if not isinstance(encoded, bytes) or not frame.matches_return(encoded, state.registers, state.memory):
+            return False
+    return True
+
+
+def _nested_callee_frame_8616(ctx, block, instruction, callee_addr, registers, memory):
+    caller_cs = ctx.boot_block_selectors.get(block.addr, ctx.selector)
+    encoded = ctx.machine_bytes.get(instruction.addr)
+    if not isinstance(encoded, bytes):
+        return None
+    target = _nested_direct_call_fetch_8616(instruction.addr, caller_cs, encoded)
+    if target is None or target[1] != callee_addr:
+        return None
+    return _nested_direct_call_frame_8616(instruction.addr, caller_cs, encoded, registers, memory)
+
+
+def _active_nested_dependency_8616(ctx, artifact, site):
+    parent = ctx.active_callee
+    if parent is None or parent.coverage.artifact is not artifact:
+        return None
+    matches = [
+        proof for proof in parent.state.call_preservations
+        if type(proof) is SegmentCallPreservationResult8616
+        and proof.caller.artifact is artifact and proof.callsite_addr == site
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _cross_nested_call_8616(ctx, artifact, instruction, registers, memory):
+    proof = _active_nested_dependency_8616(ctx, artifact, instruction.addr)
+    if proof is None:
+        return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
+    scope = ctx.active_callee.state.invocation_scope
+    if not proof.complete_for(scope):
+        return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+    encoded = ctx.machine_bytes.get(instruction.addr)
+    if not isinstance(encoded, bytes):
+        return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+    return _cross_matched_direct_call_8616(
+        ctx, proof, scope, instruction.addr, ctx.selector, encoded, registers, memory,
+    )
+
+
+def _cross_matched_direct_call_8616(ctx, proof, scope, site, selector, encoded, registers, memory):
+    """Carry effects forward only after matching the native saved frame."""
+    callee = proof.callee
+    child = callee.coverage.artifact
+    target = _nested_direct_call_fetch_8616(site, selector, encoded)
+    if (target is None or target[1] != child.function_addr
+        or (target[1], id(child), target[0]) not in ctx.censused_callees):
+        return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+    frame = _nested_direct_call_frame_8616(site, selector, encoded, registers, memory)
+    if frame is None:
+        return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+    exits = _simulate_callee_8616(ctx, proof, _PathState8616(dict(registers), memory.copy()), frame=frame)
+    if isinstance(exits, Real16InvocationFailure8616):
+        return exits
+    if not _nested_call_exits_match_8616(ctx, callee, frame, exits):
+        return Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
+    failure = _reconcile_call_exit_8616(
+        proof, scope, callee, exits, registers, memory, matched_far_frame=frame.far,
+    )
+    if failure is None:
+        registers["cs"] = frame.caller_cs
+        # Every matched return proved the same stack selector. Segment
+        # registers are omitted from the general-purpose post-call meet.
+        registers["ss"] = frame.ss
+    return failure
 
 
 @cython.ccall
@@ -5069,11 +5357,12 @@ def _simulate_callee_8616(
     ctx: _PathCensusContext8616,
     proof: _BoundaryProof8616,
     seed: _PathState8616,
+    *,
+    frame: _NestedCallFrame8616 | None = None,
 ) -> object:
-    """Census a complete leaf callee's raw effects under the call state.
+    """Census a complete callee's raw effects under the call state.
 
-    The preservation result guarantees a leaf (no nested calls). Callee
-    fetched bytes were already appended to the shared manifest by
+    Callee fetched bytes were already appended to the shared manifest by
     ``_census_callee_bytes_8616`` before path simulation began. The seed
     carries the caller's live register *and* memory overlay — the callee
     sees the bytes the caller provably wrote, and its own stores must
@@ -5107,9 +5396,13 @@ def _simulate_callee_8616(
     return_rows = _projected_callee_return_rows_8616(callee)
     if return_rows is None:
         return Real16InvocationFailure8616.CALLEE_WRITE_UNPROVEN
-    fused_operations = _BASE_FUSED_CALLEE_OPERATIONS_8616 if not callee.callsite_addrs else None
+    fused_operations = _BASE_FUSED_CALLEE_OPERATIONS_8616 if not callee.callsite_addrs and frame is None else None
     prior_return_rows = ctx.callee_return_rows
+    prior_callee, prior_frame, prior_selector = ctx.active_callee, ctx.active_call_frame, ctx.selector
     ctx.callee_return_rows = return_rows
+    ctx.active_callee, ctx.active_call_frame = callee, frame
+    if frame is not None:
+        ctx.selector = seed.registers["cs"]
     try:
         with source_bound_callee_transfer_8616(ctx, artifact, fused_operations):
             return _simulate_scope_8616(
@@ -5128,6 +5421,7 @@ def _simulate_callee_8616(
             )
     finally:
         ctx.callee_return_rows = prior_return_rows
+        ctx.active_callee, ctx.active_call_frame, ctx.selector = prior_callee, prior_frame, prior_selector
 
 
 @cython.ccall
@@ -5265,6 +5559,9 @@ def _simulate_path_block_8616(
     stop_after: int | None,
 ) -> _PathState8616 | Real16InvocationFailure8616:
     """Bind then simulate one block's ordered effects; return exit state."""
+    if type(ctx.chain) is RawBootEntrySurface8616 and ctx.chain.artifact is artifact:
+        if entry.registers.get("cs") != ctx.boot_block_selectors.get(block.addr, ctx.selector):
+            return Real16InvocationFailure8616.CS_PATH_UNPROVEN
     fused: object
     prefix: object
     fused = _try_active_fused_callee_transfer_8616(ctx, artifact, block, entry, stop_after)
@@ -5974,8 +6271,15 @@ def _feasibility_call_effect_8616(
         return False
     if not _feasibility_code_unmodified_8616(ctx, state.memory, caller_range=caller_range):
         return False
-    exits = _simulate_callee_8616(ctx, proof, state)
+    frame = None
+    if callee.callsite_addrs:
+        frame = _nested_callee_frame_8616(ctx, block, instruction, address, state.registers, state.memory)
+        if frame is None:
+            return False
+    exits = _simulate_callee_8616(ctx, proof, state, frame=frame)
     if isinstance(exits, Real16InvocationFailure8616):
+        return False
+    if frame is not None and not _nested_call_exits_match_8616(ctx, callee, frame, exits):
         return False
     return _feasibility_callsite_bytes_current_8616(ctx, instruction) and _reconcile_call_exit_8616(
         proof, consumed.scope, callee, exits, state.registers, state.memory,
@@ -6669,6 +6973,48 @@ def _complete_prefix_extension_8616(
     return False if prefix is None else _try_prefix_extension_8616(ctx, artifact, boundary, seed, prefix)
 
 
+def _boot_selector_routes_8616(ctx, artifact, boundary, blocks, dangerous):
+    """Propagate one CS per boot block along exact immediate far jumps."""
+    pending = [(artifact.function_addr, ctx.selector)]
+    while pending:
+        ctx.work_units += 1
+        failure = _census_resource_failure_8616(ctx)
+        if failure is not None:
+            return failure
+        address, selector = pending.pop()
+        if address not in dangerous:
+            continue
+        prior = ctx.boot_block_selectors.get(address)
+        if prior is not None:
+            if prior != selector:
+                return Real16InvocationFailure8616.CS_PATH_UNPROVEN
+            continue
+        ctx.boot_block_selectors[address] = selector
+        block = blocks[address]
+        sites = {i.addr for i in block.instrs if type(i.addr) is int}
+        outgoing = selector
+        if sites and address != ctx.stop_block_addr and block.successor_addrs:
+            site = max(sites)
+            machine = _machine_census_8616(ctx, address)
+            if isinstance(machine, Real16InvocationFailure8616):
+                return machine
+            machine = _partition_machine_census_8616(machine, boundary, address)
+            if isinstance(machine, Real16InvocationFailure8616):
+                return machine
+            size, encoding = machine.get(site, (0, b""))
+            if site == max(machine, default=-1) and size == 5 and len(encoding) == 5 and encoding[0] == 0xea:
+                outgoing = int.from_bytes(encoding[3:], "little")
+                ip = int.from_bytes(encoding[1:3], "little")
+                target = ((outgoing << 4) + ip) & 0xfffff
+                if block.successor_addrs != (target,):
+                    return Real16InvocationFailure8616.CS_PATH_UNPROVEN
+                ctx.boot_far_jumps[address] = (site, outgoing)
+        pending.extend((target, outgoing) for target in block.successor_addrs if target in dangerous)
+    if set(ctx.boot_block_selectors) != set(dangerous):
+        return Real16InvocationFailure8616.CS_PATH_UNPROVEN
+    return None
+
+
 def _census_invocation_8616(
     ctx: _PathCensusContext8616,
     artifact: IRFunctionArtifact,
@@ -6708,13 +7054,18 @@ def _census_invocation_8616(
         return native
     ctx.native_blocks[artifact.function_addr] = native
     blocks_by_addr = {block.addr: block for block in iter(artifact.blocks)}
+    boot_root = type(ctx.chain) is RawBootEntrySurface8616
+    if boot_root:
+        failure = _boot_selector_routes_8616(ctx, artifact, boundary, blocks_by_addr, dangerous)
+        if failure is not None:
+            return failure
     for addr in sorted(dangerous):
         if time.monotonic() > ctx.deadline:
             return Real16InvocationFailure8616.CENSUS_DEADLINE_EXCEEDED
         block = blocks_by_addr[addr]
         failure = _census_block_bytes_8616(
             ctx, block, stop_after=callsite_addr if block is call_block else None,
-            boundary=boundary,
+            boundary=boundary, boot_root=boot_root,
         )
         if failure is not None:
             return failure
@@ -6926,7 +7277,10 @@ def _census_path_callees_8616(
                     cast(Real16InvocationDomain8616 | None, scope),
                 ):
                     continue
-            failure = _census_callee_bytes_8616(ctx, proof)
+            raw = ctx.machine_bytes.get(instruction.addr)
+            selector = (int.from_bytes(raw[3:5], "little")
+                        if isinstance(raw, bytes) and len(raw) == 5 and raw[0] == 0x9a else None)
+            failure = _census_callee_bytes_8616(ctx, proof, fetch_selector=selector)
             if failure is not None:
                 return failure
     return None
@@ -7061,7 +7415,7 @@ class Real16CallChainLink8616:
         if not self.callsite_index.stats.closed:
             return False
         callsite = self.callsite
-        if type(callsite) is not DecodedDirectCallsite8616 or callsite.is_far:
+        if type(callsite) is not DecodedDirectCallsite8616:
             return False
         if (
             operator.ne(callsite.callsite_addr, parent.callsite_addr)
@@ -7077,9 +7431,11 @@ class Real16CallChainLink8616:
             or operator.ne(callee_boundary.addr, callee_artifact.function_addr)
         ):
             return False
-        if not _bound_callsite_entry_8616(
-            parent, self.callsite_index, callsite, callee_artifact.function_addr,
-        ):
+        bound = (
+            _bound_far_chain_row_8616(self, callee_artifact.function_addr) if callsite.is_far
+            else _bound_callsite_entry_8616(parent, self.callsite_index, callsite, callee_artifact.function_addr)
+        )
+        if not bound:
             return False
         if not _chain_call_entry_bound_8616(self):
             return False
@@ -7468,6 +7824,10 @@ def _near_call_entry_binding_bound_8616(
 @cython.ccall
 def _chain_call_entry_bound_8616(chain: Real16CallChainLink8616) -> cython.bint:
     """Select entry-only control or the unchanged retained-return contract."""
+    if chain.callsite.is_far:
+        # A far entry has its own selector and frame; the replayed capture
+        # is checked separately. Never use a near-preservation receipt here.
+        return chain.entry_binding is None and chain.edge is None
     if chain.entry_binding is None:
         return _chain_edge_bound_8616(
             chain.parent,chain.callsite_artifact,chain.callee_artifact.function_addr,chain.edge,
@@ -7514,7 +7874,7 @@ def _chain_link_owned_identity_8616(
     ):
         return Real16InvocationFailure8616.CHAIN_LINK_UNPROVEN
     callsite = chain.callsite
-    if type(callsite) is not DecodedDirectCallsite8616 or callsite.is_far:
+    if type(callsite) is not DecodedDirectCallsite8616:
         return Real16InvocationFailure8616.CHAIN_LINK_UNPROVEN
     if (
         operator.ne(callsite.callsite_addr, parent.callsite_addr)
@@ -7556,13 +7916,30 @@ def _chain_link_identity_8616(
     parent, callsite = chain.parent, chain.callsite
     # Lookup membership alone cannot prove the executed destination. Bind
     # the retained encoding to the parent census and require exact entry.
-    if not _bound_callsite_entry_8616(
-        parent, chain.callsite_index, callsite, artifact.function_addr,
-    ):
+    bound = (
+        _bound_far_chain_row_8616(chain, artifact.function_addr) if callsite.is_far
+        else _bound_callsite_entry_8616(parent, chain.callsite_index, callsite, artifact.function_addr)
+    )
+    if not bound:
         return Real16InvocationFailure8616.CHAIN_LINK_UNPROVEN
     if validate_entry and not _chain_call_entry_bound_8616(chain):
         return Real16InvocationFailure8616.CHAIN_LINK_UNPROVEN
     return None
+
+
+def _bound_far_chain_row_8616(chain, target) -> bool:
+    row = chain.callsite
+    coordinates = row.encoded_far_coordinates()
+    if (coordinates is None or coordinates[1] != target
+            or row.callsite_addr not in chain.callsite_boundary.reachable_instruction_addrs
+            or not any(candidate is row for candidate in chain.callsite_index.for_target(target))):
+        return False
+    instruction = row.instructions[row.instruction_index]
+    try:
+        loaded = bytes(chain.parent.project.loader.memory.load(row.callsite_addr, 5))
+    except (KeyError, ValueError):
+        return False
+    return loaded == bytes(instruction.bytes)
 
 
 @cython.ccall
@@ -7691,7 +8068,7 @@ def _chain_seed_from_capture_8616(
         # A retained state that disagrees with the freshly replayed
         # capture is forged or stale evidence, never a valid seed.
         return Real16InvocationFailure8616.CHAIN_LINK_UNPROVEN
-    if operator.ne(captured["cs"], parent.entry_segment):
+    if not chain.callsite.is_far and operator.ne(captured["cs"], parent.entry_segment):
         # The captured call-row CS must be exactly the selector the
         # parent premise proved; anything else means the path state
         # diverged from the premise's own claim.
@@ -7704,7 +8081,32 @@ def _chain_seed_from_capture_8616(
     # Memory transports from the *freshly replayed* capture, never a
     # retained field: the replayed equality above binds it to the same
     # callsite row the registers were captured at.
-    return captured, restore_path_memory_8616(replayed.callsite_memory)
+    memory = restore_path_memory_8616(replayed.callsite_memory)
+    if chain.callsite.is_far and not _far_entry_capture_bound_8616(
+        parent.project, chain.callsite.callsite_addr,
+        chain.callee_artifact.function_addr, parent.entry_segment, captured, memory,
+    ):
+        return Real16InvocationFailure8616.CHAIN_LINK_UNPROVEN
+    return captured, memory
+
+
+def _far_entry_capture_bound_8616(project, site, target, caller_cs, registers, memory) -> bool:
+    """Check the captured selector and frame against the loaded CALL bytes."""
+    from inertia.semantics.callee_stack_effects import prove_far_call_entry_8616
+
+    cs, ss, sp = (registers.get(name) for name in ("cs", "ss", "sp"))
+    if any(type(word) is not int or not 0 <= word <= 0xFFFF for word in (caller_cs, cs, ss, sp)):
+        return False
+    if memory.tainted:
+        return False
+    entry = prove_far_call_entry_8616(
+        project, callsite_addr=site, target_addr=target, caller_cs=caller_cs,
+        stack_segment=ss, pre_call_sp=(sp + 4) & 0xFFFF,
+    )
+    if entry is None or cs != entry.callee_cs or sp != entry.callee_sp:
+        return False
+    slot = entry.saved_frame
+    return _NestedCallFrame8616(slot.caller_cs, slot.return_ip, ss, slot.ip_slot, True).matches_memory(memory)
 
 
 @cython.ccall
@@ -7889,9 +8291,9 @@ def _census_link_surface_8616(
     enclosing pair for an ``ENCLOSED_ENTRY`` link, the raw pair itself for
     a raw boot surface — while the *anchor pair* — always the callee pair
     — is what a supplied coverage must bind. A raw boot surface is
-    eligible only when every retained refusal is a pending selector-window
-    gate; raw census geometry is not edge proof, so any other refusal
-    stays unbound. A declared application link accepts a refusal-free or
+    eligible if refusal-free or if every retained refusal is a pending
+    selector-window gate. Raw census geometry is not edge proof, so any
+    other refusal stays unbound. A declared application link accepts a refusal-free or
     selector-pending surface; its distinct seed authenticates the explicit
     entry authority instead of assuming original startup reaches that head.
     """
@@ -7903,7 +8305,8 @@ def _census_link_surface_8616(
         return (chain.artifact, chain.boundary, chain.artifact, chain.boundary,
                 Real16InvocationFailure8616.DECLARED_ENTRY_UNPROVEN)
     if type(chain) is RawBootEntrySurface8616:
-        if not raw_boot_entry_surface_pending_8616(chain):
+        has_refusals = bool(chain.artifact.refusals) or any(block.refusals for block in chain.artifact.blocks)
+        if has_refusals and not raw_boot_entry_surface_pending_8616(chain):
             return Real16InvocationFailure8616.COVERAGE_UNBOUND
         return (
             chain.artifact,
@@ -8416,8 +8819,8 @@ def _derive_invocation_domain_body_8616(
     return _Derivation8616(
         constructed_chain=chain if construction is not None and type(chain) is Real16CallChainLink8616 else None,
         domain=_DerivedDomain8616(
-            minimum_selector=selector,
-            maximum_selector=selector,
+            minimum_selector=ctx.boot_block_selectors.get(call_block.addr, selector),
+            maximum_selector=ctx.boot_block_selectors.get(call_block.addr, selector),
             entry_segment=entry_segment,
             entry_offset=entry_offset,
             stack_segment=stack_segment,

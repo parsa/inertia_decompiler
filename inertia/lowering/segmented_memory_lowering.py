@@ -15,6 +15,7 @@ import cython
 
 import builtins
 import contextlib
+import copy
 import functools
 import typing
 from collections.abc import Callable, MutableMapping, Sequence
@@ -2229,16 +2230,52 @@ def _lowered_matched_access_8616(
     macro = _seg_macro_for_width_bits_8616(matched.width_bits)
     if macro is None:
         return None
-    return cast(
-        object,
-        structured_c.CFunctionCall(
-            macro,
-            None,
-            [matched.segment_expr, matched.offset_expr],
-            codegen=codegen,
-            tags=_exact_segmented_load_tags_8616(matched, codegen, macro, expr),
-        ),
+    helper_call = structured_c.CFunctionCall(
+        macro,
+        None,
+        [matched.segment_expr, matched.offset_expr],
+        codegen=codegen,
+        tags=_exact_segmented_load_tags_8616(matched, codegen, macro, expr),
     )
+    return cast(object, _preserve_signed_load_type_8616(expr, helper_call, matched.width_bits, codegen))
+
+
+@cython.ccall
+def _preserve_signed_load_type_8616(
+    expr: object,
+    helper_call: object,
+    width_bits: cython.longlong,
+    codegen: object,
+) -> object:
+    """Keep a signed dereference signed after lowering to an unsigned SEG_U* helper.
+
+    SEG_U8/SEG_U16 yield unsigned values; an enclosing widening cast of a signed
+    load (for example CBW) would otherwise zero-extend instead of sign-extend.
+    """
+    load_type = _dynamic_angr_attr_8616(_strip_casts_8616(expr), "type", None)
+    if _dynamic_angr_attr_8616(load_type, "signed", False) is not True:
+        return helper_call
+    load_bits = _dynamic_angr_attr_8616(load_type, "size", None)
+    if load_bits != width_bits or width_bits not in (8, 16):
+        return helper_call
+    signed_type = SimTypeChar(signed=True) if width_bits == 8 else SimTypeShort(signed=True)
+    arch = _dynamic_angr_attr_8616(_dynamic_angr_attr_8616(codegen, "project", None), "arch", None)
+    if arch is not None:
+        signed_type = signed_type.with_arch(arch)
+    lowered: object = structured_c.CTypeCast(None, signed_type, helper_call, codegen=codegen)
+    # The matched expression may carry the widening conversion of the signed
+    # load (``(short)*(char *)p``); re-apply those value casts so the sign
+    # extension survives replacing the whole expression.
+    outer_casts: list[object] = []
+    current = expr
+    while isinstance(current, structured_c.CTypeCast):
+        outer_casts.append(current)
+        current = current.expr
+    for outer_cast in reversed(outer_casts):
+        rebuilt = copy.copy(outer_cast)
+        rebuilt.expr = lowered
+        lowered = rebuilt
+    return lowered
 
 
 @cython.ccall

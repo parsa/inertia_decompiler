@@ -20117,6 +20117,23 @@ class _GlobalIncdecRun8616:
     ) -> None:
         """Materialize one INC/DEC fact through replace-then-insert ordering."""
         materialized_by: object
+        # Keep the lifted RMW when its native memory store is still present.
+        # Rebuilding it as a flat global discards both segment projections.
+        native_updates = [
+            node for node in _iter_structured_c_nodes_8616(self.root)
+            if isinstance(node, structured_c.CAssignment)
+            and node.tags.get("ins_addr") == fact.ins_addr
+            and isinstance(node.tags.get("vex_stmt_idx"), int)
+            and (
+                isinstance(node.lhs, structured_c.CUnaryOp) and node.lhs.op == "Dereference"
+                or runtime_segment_access_space_8616(self.project, self.codegen, node.lhs) is MemSpace.DS
+            )
+        ]
+        if len(native_updates) == 1:
+            consumed_facts.add(fact)
+            self.stats["classified_fact_count"] = int(self.stats.get("classified_fact_count", 0) or 0) + 1
+            self._count_already_materialized_8616()
+            return
         self.cvar = self._build_fact_cvar_8616(fact)
         fact_key = DirectGlobalUpdateFact8616(self.addr, self.width, int(self.delta), int(fact.ins_addr))
         if self._already_materialized_8616(fact, fact_key, consumed_facts):
@@ -20552,6 +20569,19 @@ def materialize_direct_stack_incdec_instructions_8616(
 
     stats = _stack_update_stats_8616(codegen)
     facts = _filtered_stack_update_facts_8616(codegen, project, function, stats, debug_stack_noise, root)
+    # The stack-only replacement cannot carry a sibling FLAGS write. Leave
+    # the original effects together whenever the structured tree retains it.
+    flags_offset = project.arch.registers["flags"][0]
+    flag_sites = {
+        node.tags.get("ins_addr")
+        for node in _iter_structured_c_nodes_8616(root)
+        if isinstance(node, structured_c.CAssignment)
+        and physical_register_offset_8616(node.lhs) == flags_offset
+    }
+    if flag_sites:
+        retained = tuple(fact for fact in facts if fact.ins_addr not in flag_sites)
+        stats["live_flag_sibling_refusal_count"] = len(facts) - len(retained)
+        facts = retained
     if not facts:
         if debug_stack_noise:
             log.warning(
@@ -20725,7 +20755,26 @@ class _DirectStackMovRun8616:
         self.dst_expr = (
             _direct_stack_move_destination_expr_8616(self.codegen, self.fact, self.dst_cvar) if self.dst_cvar is not None else None
         )
-        self.source_expr = _direct_stack_move_source_expr_8616(self.codegen, self.fact, self.dst_cvar)
+        self.source_expr = None
+        if (
+            self.fact.source_kind is DirectStackMoveSourceKind8616.GLOBAL_EXPR
+            and self.fact.source_register_offset is not None
+        ):
+            # A register-to-stack MOV uses the captured register value. Keep
+            # the source of the existing store when repairing its destination.
+            captures = [
+                node.rhs
+                for node in _iter_structured_c_nodes_8616(self.root)
+                if isinstance(node, structured_c.CAssignment)
+                and node.tags.get("ins_addr") == self.fact.ins_addr
+                and isinstance(node.rhs, structured_c.CVariable)
+                and _sim_register_identity_8616(node.rhs.variable)
+                == ("reg", (self.fact.source_register_offset, self.fact.width))
+            ]
+            if len(captures) == 1:
+                self.source_expr = captures[0]
+        if self.source_expr is None:
+            self.source_expr = _direct_stack_move_source_expr_8616(self.codegen, self.fact, self.dst_cvar)
         if self.dst_cvar is None or self.dst_expr is None or self.source_expr is None:
             self.stats["failure_count"] = int(self.stats.get("failure_count", 0) or 0) + 1
             return True

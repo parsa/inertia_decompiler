@@ -2479,6 +2479,6 @@ def _stack_object_name(offset: cython.longlong, *, codegen: object | None = None
     if offset in arg_offsets:
         return f"arg_{offset:x}"
 
-    if offset >= 0:
-        return f"local_{offset:x}"
+    if offset > 0:
+        return f"frame_pos_{offset:x}"
     return f"local_{-offset:x}"

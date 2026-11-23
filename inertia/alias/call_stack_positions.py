@@ -56,7 +56,7 @@ class CallStackPosition8616:
     return_frame_bytes: cython.longlong
     caller_before_offset: cython.longlong
     callee_entry_offset: cython.longlong
-    caller_after_offset: cython.longlong
+    caller_after_offset: int | None
 
 
 @dataclasses.dataclass(frozen=True, )
@@ -120,7 +120,7 @@ class _CallObserver:
 
 
 @cython.ccall
-def _call_coordinates(call: IRInstr) -> IRCallStackCoordinates8616 | None:
+def _call_coordinates(call: IRInstr, *, require_return: bool = True) -> IRCallStackCoordinates8616 | None:
     """Authenticate frame width and net transfer against current source/body."""
     coordinates: object
     effect: object
@@ -138,10 +138,40 @@ def _call_coordinates(call: IRInstr) -> IRCallStackCoordinates8616 | None:
     if (isinstance(target, IRValue) and target.space is MemSpace.CONST
             and operator.ne(target.const, coordinates.target_addr)):
         return None
-    if (not coordinates.has_proven_sp_delta or coordinates.net_sp_delta is None
+    if require_return and (not coordinates.has_proven_sp_delta or coordinates.net_sp_delta is None
             or operator.ne(effect.net_stack_delta, coordinates.net_sp_delta)):
         return None
     return coordinates
+
+
+def _terminal_call_coordinates_8616(block, index, call):
+    """Authenticate an entry-only call under the opt-in closed-cycle premise."""
+    import os
+    if os.environ.get("INERTIA_OPUS_PRINCE_STARTUP_RETURN") != "1":
+        return None
+    from inertia.frontend.x86_16.opus_cs_census import censused_closed_cycle_8616, census_selectors_8616
+    from inertia.semantics.callsite_summary import CallsiteMachineFrameKind8616
+    from inertia.semantics.direct_ret_call_effect import direct_call_target_is_bound_8616
+
+    coordinates = _call_coordinates(call, require_return=False)
+    if coordinates is None or index != len(block.instrs) - 1:
+        return None
+    site, end, target = coordinates.callsite_addr, coordinates.return_addr, coordinates.target_addr
+    frame = coordinates.return_frame_bytes
+    project = coordinates.source.project
+    if tuple(block.successor_addrs) not in ((), (end,)):
+        return None
+    if frame != 2 or not direct_call_target_is_bound_8616(
+        project, site, end, target, CallsiteMachineFrameKind8616.NEAR,
+    ):
+        return None
+    selectors = census_selectors_8616(site)
+    if len(selectors) != 1 or selectors != census_selectors_8616(target):
+        return None
+    base = selectors[0] << 4
+    if not all(base <= addr <= base + 0xffff for addr in (site, end, target)):
+        return None
+    return coordinates if censused_closed_cycle_8616(project, target) else None
 
 
 def _observed_call_positions_8616(
@@ -270,8 +300,12 @@ def prove_call_stack_position_8616(
     if call.op != "CALL" or call.addr is None:
         return CallStackPositionResult8616(None, CallStackPositionRefusal8616.INVALID_CALL)
     coordinates = _call_coordinates(call)
+    terminal = False
+    if coordinates is None:
+        coordinates = _terminal_call_coordinates_8616(block, instruction_index, call)
+        terminal = coordinates is not None
     if (coordinates is None or coordinates.return_addr is None
-            or coordinates.return_frame_bytes is None or coordinates.net_sp_delta is None
+            or coordinates.return_frame_bytes is None or (coordinates.net_sp_delta is None and not terminal)
             or coordinates.target_addr is None):
         helper_position = _stack_probe_helper_position_8616(
             artifact, block, instruction_index, call)
@@ -287,7 +321,7 @@ def prove_call_stack_position_8616(
     proof = CallStackPosition8616(
         artifact.function_addr, block_addr, instruction_index, call.addr, coordinates.target_addr,
         coordinates.return_addr, coordinates.return_frame_bytes,
-        before, entry, before + coordinates.net_sp_delta,
+        before, entry, None if terminal else before + coordinates.net_sp_delta,
     )
     return CallStackPositionResult8616(proof, None)
 

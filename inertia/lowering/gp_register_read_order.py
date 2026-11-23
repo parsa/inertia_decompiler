@@ -52,7 +52,9 @@ def _read_only_node_8616(
     return False
 
 
-def _read_only_expression_8616(root: object, is_register_leaf: Callable[[object], cython.bint]) -> cython.bint:
+def _read_only_expression_8616(
+    root: object, is_register_leaf: Callable[[object], cython.bint], terminal_call: object = None,
+) -> cython.bint:
     """Check every edge while refusing cycles and propagating child-read defects."""
     leaving: object
     node: object
@@ -70,12 +72,53 @@ def _read_only_expression_8616(root: object, is_register_leaf: Callable[[object]
             return False
         if identity in complete:
             continue
-        if not _read_only_node_8616(node, is_register_leaf):
+        if node is not terminal_call and not _read_only_node_8616(node, is_register_leaf):
             return False
         active.add(identity)
         work.append((node, True))
         work.extend((child, False) for child in builtins.iter(iter_c_direct_children_8616(node)))
     return True
+
+
+def terminal_frame_argument_reads_first_8616(statement, is_register_leaf) -> bool:
+    """Recognize the typed terminal frame call with read-only arguments.
+
+    The call can affect machine state, but C evaluates its arguments
+    before entering the helper. No sibling effect may precede them.
+    """
+    if not isinstance(statement, c.CAssignment):
+        return False
+    layouts = {
+        "inertia_word_near_return_cleanup": ("inertia_ret_word", 3),
+        "inertia_word_far_return_cleanup": ("inertia_retf_word", 3),
+        "inertia_word_interrupt_return": ("inertia_iret_word", 2),
+    }
+    matches = [(tag, value) for tag, value in layouts.items() if tag in statement.tags]
+    if len(matches) != 1:
+        return False
+    tag, (name, argc) = matches[0]
+    pending = [statement.rhs]
+    seen = set()
+    call = None
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            # A shared subtree could evaluate its effect twice.
+            return False
+        seen.add(id(node))
+        if isinstance(node, c.CFunctionCall):
+            if (
+                call is not None or node.callee_target != name or len(node.args or ()) != argc
+                or tag not in node.tags or node.tags[tag] != statement.tags[tag]
+                or node.tags.get("ins_addr") != statement.tags.get("ins_addr")
+            ):
+                return False
+            call = node
+        pending.extend(iter_c_direct_children_8616(node))
+    return (
+        call is not None and _read_only_expression_8616(statement.lhs, is_register_leaf)
+        and _read_only_expression_8616(statement.rhs, is_register_leaf, call)
+    )
 
 
 @cython.ccall

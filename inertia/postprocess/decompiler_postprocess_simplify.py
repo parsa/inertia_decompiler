@@ -2355,7 +2355,7 @@ class _SimplifyExpressionRun8616:
 
 @cython.ccall
 def _simplify_structured_expressions_8616(codegen: object) -> cython.bint:
-    return _SimplifyExpressionRun8616(codegen=codegen).run()
+    return _SimplifyExpressionRun8616(codegen=codegen, changed_local=False).run()
 @cython.ccall
 def _is_virtual_register_temporary_8616(lhs: object) -> cython.bint:
     """Accept only register-backed carriers, never stack or memory storage."""

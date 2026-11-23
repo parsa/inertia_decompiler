@@ -335,6 +335,11 @@ class SegmentCallPreservationResult8616:
         """Project identities only for an authenticated consuming scope."""
         if not self.complete_for(invocation_scope):
             return ()
+        # A far target certificate does not establish caller register
+        # preservation; that needs the actual saved frame at replay.
+        entry_record = _call_entry_8616(self.caller, self.callee, self.index, self.callsite_addr)
+        if entry_record is None or entry_record.is_far:
+            return ()
         state = self.callee.state
         entry = state.entry_states[self.callee.coverage.artifact.function_addr]
         return tuple(
@@ -576,7 +581,6 @@ def _call_entry_8616(
         entry for entry in builtins.iter(index.for_target(target))
         if operator.eq(entry.caller_start, caller.artifact.function_addr)
         and operator.eq(entry.callsite_addr, site) and operator.eq(entry.target_addr, target)
-        and not entry.is_far
     )
     if len(entries) != 1:
         return None
@@ -691,6 +695,17 @@ def _call_target_failure_8616(
     target = call.args[0] if call.args else None
     if not isinstance(target, IRValue):
         return SegmentCallPreservationFailure8616.TARGET_MISMATCH, None
+    if entry.is_far:
+        from inertia.semantics.callee_stack_effects import direct_call_target_is_bound_8616
+        from inertia.semantics.callsite_summary import CallsiteMachineFrameKind8616
+
+        coordinates = entry.encoded_far_coordinates()
+        if (coordinates is None or coordinates[1] != callee_addr
+            or target.space is not MemSpace.CONST
+            or not direct_call_target_is_bound_8616(
+                caller.boundary.project, site, coordinates[0], callee_addr, CallsiteMachineFrameKind8616.FAR,
+            )):
+            return SegmentCallPreservationFailure8616.TARGET_MISMATCH, None
     if target.space is MemSpace.CONST:
         return _constant_call_target_failure_8616(target, callee_addr, expected), None
     # Defer the Semantics binding owner until proof time: the ir package

@@ -17532,17 +17532,10 @@ def _rename_local_map_stack_var_8616(
     stack_name_pat: StructuredAstValue,
 ) -> None:
     """Rename one stack carrier entry in a local-variable map when evidence exists."""
-    ident: object
     name: object
     new_name: object
     if var.__class__.__name__ != "SimStackVariable":
         return
-    ident = getattr(var, "ident", None)
-    if ident is None:
-        try:
-            var.ident = ""
-        except Exception:
-            return
     # Normalize unresolved stack carrier names to stable stack semantics.
     # This is typed/name materialization from stack offsets, not text cleanup.
     name = getattr(var, "name", None)
@@ -18969,6 +18962,14 @@ def _finalize_failed_postprocess_validation_8616(
             "Postprocess validation failed due to final invariant; refusing stable fallback: %s",
             validation["verdict"],
         )
+        # Retain the first blocking cause: later stages may refuse on the
+        # resulting stale evidence, which must not replace it in the report.
+        primary = getattr(self.project, "_inertia_primary_validation_failure_8616", None)
+        if not isinstance(primary, dict):
+            primary = {}
+            self.project._inertia_primary_validation_failure_8616 = primary
+        primary.setdefault(getattr(getattr(self.codegen, "cfunc", None), "addr", None),
+                           str(validation["verdict"]))
         self.project._inertia_decompiler_stage = "postprocess_failed"
         return True
     _should_return = _handle_failed_postprocess_validation_8616(

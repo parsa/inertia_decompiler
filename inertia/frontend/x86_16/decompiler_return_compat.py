@@ -2505,7 +2505,9 @@ def _caller_use_ret_val_8616(prototype: object, calling_convention: object) -> o
     """Resolve the caller-use return location for a guessed prototype."""
     returnty: object
     returnty = getattr(prototype, "returnty", None)
-    if calling_convention is None:
+    # A guessed prototype may not carry a return type yet; the x86-16 result
+    # register is AX either way, and angr's return_val() requires a type.
+    if calling_convention is None or returnty is None:
         return SimRegArg("ax", 2)
     return cast(Any, calling_convention).return_val(returnty)
 

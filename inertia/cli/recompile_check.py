@@ -237,6 +237,12 @@ def _sanitize_empty_control_bodies_for_compile_8616(text: object) -> object:
 @cython.ccall
 def _with_runtime_header_8616(c_text: object, *, target: object) -> object:
     text = _sanitize_empty_control_bodies_for_compile_8616(c_text)
+    needs_word_return = any(
+        f"{name}(" in text and f"static uint16_t {name}(" not in text
+        for name in ("inertia_ret_word", "inertia_retf_word", "inertia_iret_word", "inertia_call_far_linear")
+    )
+    if needs_word_return:
+        return f"{render_c_runtime_header_8616(target, word_far_return=True)}\n{text.lstrip()}"
     if target == "portable-flat":
         if "extern uint8_t inertia_memory[];" in text and "#define SEG_U8(seg, off)" in text:
             return text

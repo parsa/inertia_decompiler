@@ -53,6 +53,94 @@ _RUNTIME_FLAGS_ADDRESS_8616 = 0x1_0018
 _RUNTIME_FLAGS_NAME_8616 = "inertia_flags"
 
 
+def packed_flags_exit_assignment_8616(
+    codegen: object, function_addr: int, value: structured_c.CExpression,
+) -> structured_c.CAssignment:
+    """Publish the reaching packed FLAGS value at a structured exit."""
+    record_global_declaration_spec_8616(
+        codegen, ctype=GlobalDeclarationCType8616.UNSIGNED_SHORT,
+        name=_RUNTIME_FLAGS_NAME_8616, array_len=None,
+    )
+    target = structured_c.CVariable(
+        SimMemoryVariable(
+            _RUNTIME_FLAGS_ADDRESS_8616, 2, name=_RUNTIME_FLAGS_NAME_8616,
+            region=function_addr, category="inertia_flags_state",
+        ),
+        variable_type=SimTypeShort(False), codegen=codegen,
+    )
+    return structured_c.CAssignment(target, value, codegen=codegen)
+
+
+def publish_loop_packed_flags_8616(codegen):
+    """Publish a retained packed update before an effectful loop back edge."""
+    if os.getenv("INERTIA_EXPERIMENTAL_FLAGS_EXIT_USE") != "1":
+        return False
+    function = codegen.cfunc
+    flags_shape = codegen.project.arch.registers.get("flags")
+    if function is None or flags_shape is None:
+        return False
+    artifact = active_status_flag_lift_artifact_8616(function.addr)
+    if artifact is None:
+        resolution = resolve_status_flag_lift_artifact_8616(codegen.project, function.addr)
+        artifact = resolution.artifact if resolution is not None else None
+    if artifact is None:
+        return False
+    from .call_stack_input_contracts import call_stack_context_layout_8616
+
+    def call_free(node):
+        return not any(isinstance(item, structured_c.CFunctionCall)
+                       for item in _iter_c_nodes_deep_8616(node))
+
+    def sequence(node):
+        if isinstance(node, structured_c.CStatements):
+            for stmt in node.statements:
+                yield from sequence(stmt)
+        else:
+            yield node
+
+    changed = False
+    for loop in tuple(_iter_c_nodes_deep_8616(function.statements)):
+        if not isinstance(loop, structured_c.CDoWhileLoop) or not isinstance(loop.body, structured_c.CStatements):
+            continue
+        statements = tuple(sequence(loop.body))
+        if len(statements) < 2 or not call_free(loop.condition):
+            continue
+        update = statements[-1]
+        if not isinstance(update, structured_c.CAssignment):
+            continue
+        identity = _identity_8616(update.lhs)
+        if identity is None or identity[:2] != tuple(flags_shape[:2]):
+            continue
+        site = update.tags.get("ins_addr")
+        if site not in artifact.packed_preservation_addresses:
+            continue
+        # Only a straight-line update suffix following a single owned CALL is
+        # supported here. Its preserved bits must come from post-call FLAGS.
+        if any(not isinstance(stmt, structured_c.CAssignment) for stmt in statements[:-1]):
+            continue
+        wrappers = [node for stmt in statements[:-1] for node in _iter_c_nodes_deep_8616(stmt)
+                    if isinstance(node, structured_c.CMultiStatementExpression)
+                    and call_stack_context_layout_8616(node) is not None]
+        if len(wrappers) != 1 or statements[0].rhs is not wrappers[0]:
+            continue
+        if not all(call_free(stmt) for stmt in statements[1:]):
+            continue
+        rhs = update.rhs
+        if not isinstance(rhs, structured_c.CBinaryOp) or rhs.op != "Or":
+            continue
+        preserved = rhs.lhs
+        if (not isinstance(preserved, structured_c.CBinaryOp) or preserved.op != "And"
+            or not isinstance(preserved.rhs, structured_c.CConstant)
+            or (_identity_8616(preserved.lhs) or ())[:2] != tuple(flags_shape[:2])
+            or _flags_inputs_8616(rhs.rhs, flags_shape[:2])):
+            continue
+        publish = packed_flags_exit_assignment_8616(codegen, function.addr, update.lhs)
+        preserved.lhs = publish.lhs
+        loop.body.statements.append(publish)
+        changed = True
+    return changed
+
+
 class _FlagsArch8616(Protocol):
     """Architecture register map consumed at the third-party boundary."""
 
@@ -153,7 +241,10 @@ def _lift_candidates_8616(
     defined_identities: set[_FlagsIdentity8616] = set()
     definition_counts: dict[_FlagsIdentity8616, cython.longlong] = {}
     self_dependent_roots: dict[_FlagsIdentity8616, structured_c.CExpression] = {}
-    all_inputs: dict[_FlagsIdentity8616, structured_c.CExpression] = {}
+    # A packed update may already have been folded into a condition.
+    # Scan structured reads as well as assignment RHSs, then subtract
+    # locally defined identities before selecting entry roots.
+    all_inputs = _flags_inputs_8616(statements, flags_shape)
     for node in _iter_c_nodes_deep_8616(statements):
         if not isinstance(node, structured_c.CAssignment):
             continue
@@ -230,7 +321,11 @@ def _materialize_flag_initializers_8616(
         materialized += 1
     if initializers:
         if isinstance(cfunc.statements, structured_c.CStatements):
-            cfunc.statements.statements[0:0] = initializers
+            from .entry_stack_pointer_capture import is_entry_stack_pointer_capture_8616
+
+            statements = cfunc.statements.statements
+            after_capture = int(bool(statements) and is_entry_stack_pointer_capture_8616(statements[0]))
+            statements[after_capture:after_capture] = initializers
         else:
             cfunc.statements = structured_c.CStatements(
                 list(initializers) + [cfunc.statements],

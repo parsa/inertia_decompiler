@@ -432,7 +432,7 @@ class Eflags:
         zero = self.constant(0, v2.ty)
         result = (zero - v2).cast_to(v2.ty)
 
-        flags = self.set_carry(flags, v2 != 0)
+        flags = self.set_carry(flags, ~(v2 == zero).cast_to(Type.int_1))
         flags = self.set_parity(flags, self.chk_parity(result))
         flags = self.set_flag(flags, 4, self._adjust_flag(zero, v2, result))
         flags = self.set_zero(flags, result == 0)

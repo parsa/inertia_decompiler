@@ -36,7 +36,6 @@ from inertia.ir.ir_boundary_cfg import prove_ir_boundary_coverage_8616
 from inertia.ir.vex_import import build_x86_16_ir_function_artifact
 from inertia.semantics.callsite_summary import CallsiteMachineFrameKind8616
 
-from .direct_ret_call_effect import direct_near_call_target_is_bound_8616
 import dataclasses
 import operator
 
@@ -78,7 +77,7 @@ class BPCallPreservationResult8616:
             return False
         coverage = self.body.coverage
         return bool(coverage.boundary.project is self.project and operator.eq(coverage.artifact.function_addr, self.target_addr)
-                    and direct_near_call_target_is_bound_8616(
+                    and _bp_call_target_is_bound_8616(
                         self.project, self.callsite_addr, self.return_addr, self.target_addr, self.frame_kind,
                     ))
 
@@ -120,6 +119,14 @@ def _body_proof_8616(
     return body, None if body.complete else BPCallPreservationFailure8616.BODY_REFUSED
 
 
+def _bp_call_target_is_bound_8616(project, callsite_addr, return_addr, target_addr, frame_kind):
+    # The generic binder also authenticates loaded far-call operands. Import
+    # lazily because callee stack analysis shares this module's boundary reader.
+    from .callee_stack_effects import direct_call_target_is_bound_8616
+
+    return direct_call_target_is_bound_8616(project, callsite_addr, return_addr, target_addr, frame_kind)
+
+
 @cython.ccall
 def prove_direct_bp_call_preservation_8616(
     project: object, callsite_addr: int | None, return_addr: int | None,
@@ -129,7 +136,7 @@ def prove_direct_bp_call_preservation_8616(
     failure: object
     body = None
     failure = BPCallPreservationFailure8616.CALL_TARGET_UNPROVEN
-    if direct_near_call_target_is_bound_8616(project, callsite_addr, return_addr, target_addr, frame_kind):
+    if _bp_call_target_is_bound_8616(project, callsite_addr, return_addr, target_addr, frame_kind):
         assert target_addr is not None
         body, failure = _body_proof_8616(project, target_addr)
     accepted = int(failure is None)

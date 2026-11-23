@@ -15,7 +15,7 @@ import cython
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, cast
+from typing import ClassVar, Protocol, cast
 import dataclasses
 import operator
 
@@ -29,6 +29,63 @@ class TerminalReturnFrameKind8616(StrEnum):
     NEAR = "near"
     FAR = "far"
     INTERRUPT = "interrupt"
+
+
+@dataclass(frozen=True)
+class WordFarReturnLayout8616:
+    """The two ordered reads relative to the same pre-return SP."""
+
+    cleanup: int
+    ip_displacement: ClassVar[int] = 0
+    cs_displacement: ClassVar[int] = 2
+
+    @property
+    def sp_displacement(self) -> int:
+        return (4 + self.cleanup) & 0xFFFF
+
+    @classmethod
+    def from_encoding(cls, encoding: bytes) -> WordFarReturnLayout8616 | None:
+        """Bind the layout to one complete, unprefixed word encoding."""
+        if encoding == b"\xcb":
+            return cls(0)
+        if len(encoding) == 3 and encoding[0] == 0xCA:
+            return cls(int.from_bytes(encoding[1:], "little"))
+        return None
+
+
+@dataclass(frozen=True)
+class WordNearReturnLayout8616:
+    """Pop one IP word and then discard the callee's arguments."""
+
+    cleanup: int
+
+    @property
+    def sp_displacement(self) -> int:
+        return (2 + self.cleanup) & 0xFFFF
+
+    @classmethod
+    def from_encoding(cls, encoding: bytes) -> WordNearReturnLayout8616 | None:
+        if encoding == b"\xc3":
+            return cls(0)
+        if len(encoding) == 3 and encoding[0] == 0xC2:
+            return cls(int.from_bytes(encoding[1:], "little"))
+        return None
+
+
+@dataclass(frozen=True)
+class WordInterruptReturnLayout8616:
+    """A word IRET restores IP, CS and FLAGS from one stack frame."""
+
+    ip_displacement: ClassVar[int] = 0
+    cs_displacement: ClassVar[int] = 2
+    flags_displacement: ClassVar[int] = 4
+    sp_displacement: ClassVar[int] = 6
+    flags_writable_mask: ClassVar[int] = 0x0FD5
+    flags_fixed_mask: ClassVar[int] = 0x0002
+
+    @classmethod
+    def from_encoding(cls, encoding: bytes) -> WordInterruptReturnLayout8616 | None:
+        return cls() if encoding == b"\xcf" else None
 
 
 @dataclasses.dataclass(frozen=True, )

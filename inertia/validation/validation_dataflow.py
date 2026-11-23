@@ -39,6 +39,7 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CFunctionCall,
     CIfElse,
     CIndexedVariable,
+    CMultiStatementExpression,
     CReturn,
     CStatements,
     CSwitchCase,
@@ -1529,6 +1530,8 @@ class _DefUseWalker8616:
                     break
                 state = self.walk(statement, state, context=f"{context}.stmt{index}")
             return state
+        if isinstance(node, (CAssignment, CExpressionStatement, CReturn)):
+            state = self._walk_embedded_statements_8616(node, state, context)
         if isinstance(node, CAssignment):
             return self._walk_assignment_8616(node, state, context)
         if isinstance(node, CExpressionStatement):
@@ -1541,6 +1544,23 @@ class _DefUseWalker8616:
             state.falls_through = False
             return state
         return self._walk_tail_8616(node, state, context)
+
+    def _walk_embedded_statements_8616(
+        self, node: object, state: _DefUseFlowState8616, context: object
+    ) -> _DefUseFlowState8616:
+        """Walk statement blocks embedded in value position before their value.
+
+        A ``CMultiStatementExpression`` executes its statements, in order,
+        before yielding its value expression. Their definitions therefore
+        precede every later read in the enclosing statement; the enclosing
+        read check still re-examines every node, so nothing is skipped.
+        """
+        index = 0
+        for value_node in _iter_value_nodes_8616(node):
+            if isinstance(value_node, CMultiStatementExpression):
+                state = self.walk(value_node.stmts, state, context=f"{context}.embedded{index}")
+                index += 1
+        return state
 
     @cython.ccall
     def _walk_tail_8616(

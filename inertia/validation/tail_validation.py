@@ -6118,7 +6118,15 @@ class _TailValidationNodeRun8616:
     @cython.ccall
     def _record_assignment_location(self, node: TailValidationValue, location: object) -> None:
         if location.startswith("reg:"):
-            if self.mode == "coarse" or location in self.observed_locations:
+            # Explicit architectural publication is externally observable
+            # without an in-function read. In particular, resolving the
+            # input of a terminal SP write must not create its footprint.
+            explicit_exit = (
+                isinstance(node.lhs, CVariable)
+                and node.lhs.tags.get("inertia_gp_exit_only") is True
+                and getattr(node.lhs.variable, "category", None) == "inertia_gp_register_state"
+            )
+            if self.mode == "coarse" or location in self.observed_locations or explicit_exit:
                 self.register_writes.add(location)
             return
         if location.startswith(("stack:", "stack_slot:")):
@@ -6377,7 +6385,10 @@ def _def_use_call_output_definitions_8616(
     except AttributeError:
         return {}
     if query_index is not None:
-        query_index.require_root(root)
+        # Validation runs over the call-stack-input logical view: a proven
+        # input wrapper is replaced by its logical call, so that view (and
+        # not the materialized function root) is the one being validated.
+        root = query_index.root
     if not isinstance(summary_map, Mapping):
         return {}
     inventory = callsite_summary_inventory_8616(codegen)
@@ -7152,6 +7163,12 @@ class _TailSummaryBuildRun8616:
             self.normalize_loops(func_addr)
             self.process_nodes(func_addr)
             self.record_selector_returns(func_addr)
+            from .tail_validation_flags_publication import packed_flag_publication_fingerprints_8616
+
+            for publication in packed_flag_publication_fingerprints_8616(
+                self.root, lambda expr: _expr_fingerprint(expr, self.project),
+            ):
+                self.control_flow_effects.add(_json_fingerprint(("packed-flags-publication", publication)))
             return self.finalize(func_addr, summary_inventory)
         finally:
             if previous_snapshot_expr_cache is None:

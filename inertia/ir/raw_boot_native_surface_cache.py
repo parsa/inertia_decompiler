@@ -150,8 +150,6 @@ def _native_surface_key_8616(
         boundary.successor_edges, tuple(blocks), info,
         status_flag_native_policy_key_8616(project, boundary.addr),
         continuation_key,
-        tuple((edge.block_addr, edge.instruction_addr, edge.target_addr)
-              for edge in iter(boundary.conditional_edges)),
     )
     pinned = (arch, importer, build_x86_16_ir_function_artifact)
     return key, pinned

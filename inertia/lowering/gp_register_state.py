@@ -18,7 +18,7 @@ from typing import Protocol, cast
 
 from angr.ailment.expression import VirtualVariableCategory
 from angr.analyses.decompiler.structured_codegen import c as structured_c
-from angr.sim_type import SimTypeLong
+from angr.sim_type import SimTypeLong, SimTypeShort
 from angr.sim_variable import SimMemoryVariable, SimRegisterVariable
 from archinfo import Arch
 
@@ -44,7 +44,9 @@ from .global_declarations import (
     GlobalDeclarationCType8616,
     record_global_declaration_spec_8616,
 )
-from .gp_register_read_order import RegisterUpdateOrder8616, register_update_read_order_8616
+from .gp_register_read_order import (
+    RegisterUpdateOrder8616, register_update_read_order_8616, terminal_frame_argument_reads_first_8616,
+)
 from .gp_register_versions import (
     RegisterIdentity8616,
     _linear_sequence,
@@ -278,6 +280,7 @@ def runtime_gp_state_assignment_8616(
     *,
     codegen: object,
     function_addr: cython.longlong,
+    exit_only: bool = False,
 ) -> structured_c.CAssignment | None:
     """Materialize one proven architectural GP write into coherent runtime state."""
     projected: object
@@ -303,17 +306,25 @@ def runtime_gp_state_assignment_8616(
         variable_type=_runtime_gp_lane_type_8616(codegen),
         codegen=codegen,
     )
+    if exit_only:
+        source.tags = {**source.tags, "inertia_gp_exit_only": True}
     if view_width == 4:
         projected = project_pointer_storage_value_8616(codegen, value, view_width)
         return None if projected is None else structured_c.CAssignment(source, projected, codegen=codegen)
-    return _runtime_gp_subview_write_8616(
+    assignment = _runtime_gp_subview_write_8616(
         parent_name,
         bit_shift,
         view_width,
         source,
         value,
         function_addr,
+        allow_parent_mask=not exit_only,
     )
+    if exit_only:
+        for node in _iter_c_nodes_deep_8616(assignment):
+            if isinstance(node, structured_c.CVariable) and runtime_gp_name_for_variable_8616(node.variable) == parent_name:
+                node.tags = {**node.tags, "inertia_gp_exit_only": True}
+    return assignment
 
 
 class _ProjectGPRegisters8616(Protocol):
@@ -640,6 +651,7 @@ def _runtime_gp_subview_write_8616(
     function_addr: cython.longlong,
     *,
     tags: Mapping[str, object] | None = None,
+    allow_parent_mask: bool = True,
 ) -> structured_c.CAssignment:
     """Project one narrow-register write while preserving its origin tags."""
     projected: object
@@ -657,7 +669,9 @@ def _runtime_gp_subview_write_8616(
     preserve_mask = 0xFFFF_FFFF ^ (value_mask << bit_shift)
     self_mask = (
         _runtime_gp_parent_mask_8616(value, register_name, codegen)
-        if bit_shift == 0
+        # An exit operand is a reaching SSA value. An AL-shaped local
+        # need not equal runtime AL, and a signed widening is not a mask.
+        if allow_parent_mask and bit_shift == 0
         else None
     )
     if self_mask is not None:
@@ -818,7 +832,7 @@ def runtime_gp_state_names_8616(codegen: object) -> frozenset[str]:
     state_owned_names.update(
         register_name
         for node in builtins.iter(_iter_c_nodes_deep_8616(cfunc.statements))
-        if isinstance(node, structured_c.CVariable)
+        if isinstance(node, structured_c.CVariable) and not node.tags.get("inertia_gp_exit_only")
         for register_name in iter((runtime_gp_name_for_variable_8616(node.variable),))
         if register_name is not None
     )
@@ -942,16 +956,18 @@ def _entry_version_placement_8616(
     read_index: dict[cython.longlong, cython.longlong] = {}
     for index, statement in enumerate(_linear_sequence(root)):
         read_position = index * _ENTRY_STATEMENT_PHASES
+        is_register_leaf = lambda node: _c_dirty_register_identity_8616(node, project) is not None
         order = register_update_read_order_8616(
-            statement, lambda node: _c_dirty_register_identity_8616(node, project) is not None,
+            statement, is_register_leaf,
         )
+        terminal_frame = terminal_frame_argument_reads_first_8616(statement, is_register_leaf)
         write_position = (
             read_position + _ENTRY_STORE_PHASE
-            if order is RegisterUpdateOrder8616.READS_BEFORE_WRITE else read_position
+            if terminal_frame or order is RegisterUpdateOrder8616.READS_BEFORE_WRITE else read_position
         )
         if contains_effectful_call_8616(statement):
             for parent in state_owned_names:
-                first_write.setdefault(parent, read_position)
+                first_write.setdefault(parent, write_position if terminal_frame else read_position)
         for node in _iter_c_nodes_deep_8616(statement):
             if isinstance(node, structured_c.CDirtyExpression):
                 read_index[id(node)] = read_position
@@ -1023,7 +1039,7 @@ def _transform_high_byte_view_8616(
     register_name, carrier = high_byte_view
     ctx.raw_ids.add(id(node))
     if register_name not in ctx.state_owned_names:
-        return node
+        return _local_word_high_byte_view_8616(node, carrier)
     ctx.materialized_ids.add(id(node))
     _record_runtime_gp_global_8616(ctx.codegen, register_name)
     return cast(
@@ -1036,6 +1052,26 @@ def _transform_high_byte_view_8616(
             ctx.cfunc_addr,
         ),
     )
+
+
+@cython.ccall
+def _local_word_high_byte_view_8616(node: structured_c.CUnaryOp, carrier: object) -> object:
+    """Express a local 16-bit register variable's high-byte view as ``(byte)(word >> 8)``.
+
+    angr renders the view as ``*((char *)((void *)&word + 1))``; that reads the
+    same byte on little-endian x86 but is not valid C for DOS compilers.
+    """
+    if not isinstance(carrier, structured_c.CVariable) or not isinstance(carrier.variable, SimRegisterVariable):
+        return node
+    if carrier.variable.size != 2 or getattr(node.type, "size", None) != 8:
+        return node
+    shifted = structured_c.CBinaryOp(
+        "Shr",
+        carrier,
+        structured_c.CConstant(8, SimTypeShort(False), codegen=node.codegen),
+        codegen=node.codegen,
+    )
+    return structured_c.CTypeCast(None, node.type, shifted, codegen=node.codegen)
 
 
 @cython.ccall

@@ -2987,9 +2987,13 @@ def _seed_one_function_8616(
         from .terminal_register_return_types import (
             apply_terminal_register_return_type_evidence_8616,
         )
+        from inertia.frontend.x86_16.opus_cs_census import censused_closed_cycle_8616
 
         counts.add_terminal_register_stats(apply_terminal_register_return_type_evidence_8616(project, function).stats)
         _apply_far_return_calling_convention_8616(project, function)
+        entry = _analysis_function_addr_8616(function)
+        if entry is not None and censused_closed_cycle_8616(project, entry):
+            cast(Any, function).returning = False
     counts.success_count += 1
     if _is_stack_probe_helper_name_8616(_dynamic_analysis_getattr_8616(function, "name", None)):
         counts.stack_probe_count += 1

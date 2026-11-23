@@ -9,14 +9,16 @@ Consumes alias, widening, and typed facts
 Do not recover semantics from COD, source, assembly, or rendered C text
 """
 from __future__ import annotations
+import logging
+import os
 import typing
 import cython
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from angr.analyses.decompiler.structured_codegen import c
-from angr.sim_type import SimType, SimTypeBottom, SimTypeNum
+from angr.sim_type import SimType, SimTypeBottom, SimTypeFunction, SimTypeNum
 from angr.sim_variable import SimTemporaryVariable
 
 from inertia.alias.call_stack_positions import CallStackPosition8616, prove_call_stack_position_8616
@@ -113,6 +115,14 @@ def _plan_failure(call: c.CFunctionCall) -> CallStackInputFailure8616 | None:
         if value_type is None or call_stack_value_size_8616(value_type) in {None, 0}:
             return CallStackInputFailure8616.TYPE_UNPROVEN
         if not call_stack_argument_is_stable_8616(argument) or call_stack_has_runtime_sp_8616(argument):
+            if os.environ.get("INERTIA_TRACE_CALL_STACK_POSITION") == "1":
+                logging.getLogger(__name__).warning(
+                    "Call argument effect refused: call=%s nodes=%r",
+                    call.callee_target,
+                    tuple((type(node).__name__, getattr(node, "callee_target", None),
+                           getattr(node, "tags", None))
+                          for node in _iter_c_nodes_deep_8616(argument)),
+                )
             return CallStackInputFailure8616.ARGUMENT_EFFECT
     return None
 
@@ -144,9 +154,75 @@ def _existing_binding_is_current(codegen: object, function: StackPointerCaptureF
         return False
     if not isinstance(entry.variable, SimTemporaryVariable) or operator.ne(layout.marker.entry_tmp_id, entry.variable.tmp_id):
         return False
-    pairs = ((layout.pre_write, position.callee_entry_offset), (layout.post_write, position.caller_after_offset))
+    expected_entry = _call_entry_write_8616(codegen, function, entry, position)
+    if not (_same_c_expression_8616(layout.pre_write.lhs, expected_entry.lhs)
+            and _same_c_expression_8616(layout.pre_write.rhs, expected_entry.rhs)):
+        return False
+    pairs = ()
+    if position.caller_after_offset is not None:
+        pairs += ((layout.post_write, position.caller_after_offset),)
     return all(_same_c_expression_8616(actual.lhs, expected.lhs) and _same_c_expression_8616(actual.rhs, expected.rhs)
                for actual, offset in iter(pairs) if (expected := _sp_write(codegen, function, entry, offset)) is not None)
+
+
+def _call_entry_write_8616(codegen, function, entry, position):
+    from angr.sim_type import SimTypeShort
+    from inertia.semantics.callee_stack_effects import bind_immediate_far_call_site_8616
+    from .segment_register_state import runtime_segment_state_cvar_8616
+
+    if os.environ.get("INERTIA_EXPERIMENTAL_WORD_FAR_RETURN") == "1" and position.return_frame_bytes == 4:
+        site = bind_immediate_far_call_site_8616(
+            codegen.project, callsite_addr=position.callsite_addr,
+            target_addr=position.target_addr, return_addr=position.return_addr,
+        )
+        if site is not None:
+            word = SimTypeShort(False).with_arch(codegen.project.arch)
+            ss = runtime_segment_state_cvar_8616(
+                "ss", codegen=codegen, variable_type=word, function_addr=function.addr,
+            )
+            if ss is not None:
+                pre_sp = entry_stack_pointer_projection_8616(entry, position.caller_before_offset, codegen)
+                args = [ss, pre_sp, c.CConstant(site.return_addr, SimTypeNum(32, False), codegen=codegen),
+                        c.CConstant(site.callee_cs, word, codegen=codegen),
+                        c.CConstant(site.callee_ip, word, codegen=codegen)]
+                helper = c.CFunctionCall("inertia_call_far_linear", None, args, codegen=codegen)
+                assignment = runtime_gp_state_assignment_8616(
+                    "sp", c.CTypeCast(helper.type, word, helper, codegen=codegen),
+                    codegen=codegen, function_addr=function.addr,
+                )
+                if assignment is not None:
+                    return assignment
+    return _sp_write(codegen, function, entry, position.callee_entry_offset)
+
+
+def _terminal_stack_inputs_8616(source, nodes):
+    """Match typed return effects to current source-owned pre-pop SP proofs."""
+    from inertia.alias.numeric_stack_pointer_values import prove_terminal_stack_pointer_input_8616
+
+    owners = {}
+    for block in source.blocks:
+        if block.instrs and block.instrs[-1].op == "RET":
+            site = block.instrs[-1].addr
+            owners.setdefault(site, []).append(block.addr)
+    out = []
+    for assignment in nodes:
+        if not isinstance(assignment, c.CAssignment) or "inertia_word_far_return_cleanup" not in assignment.tags:
+            continue
+        site = assignment.tags.get("ins_addr")
+        blocks = owners.get(site, ())
+        if len(blocks) != 1 or not isinstance(site, int):
+            continue
+        calls = [
+            node for node in _iter_c_nodes_deep_8616(assignment.rhs)
+            if isinstance(node, c.CFunctionCall) and node.callee_target == "inertia_retf_word"
+            and node.tags.get("ins_addr") == site and len(node.args or ()) == 3
+        ]
+        if len(calls) != 1:
+            continue
+        proof = prove_terminal_stack_pointer_input_8616(source, blocks[0], site)
+        if proof is not None:
+            out.append((assignment, calls[0], proof))
+    return tuple(out)
 
 
 def _has_unowned_sp(root: object, allowed: object) -> cython.bint:
@@ -205,7 +281,7 @@ def _materialize_context(codegen: object, function: StackPointerCaptureFunction8
         temporary = locals_.create(argument_type)
         statements.append(c.CAssignment(temporary, argument, codegen=codegen))
         arguments.append(temporary)
-    statements.append(_sp_write(codegen, function, entry, plan.position.callee_entry_offset))
+    statements.append(_call_entry_write_8616(codegen, function, entry, plan.position))
     plan.call.args = arguments
     if call_stack_value_size_8616(plan.call.type) == 0 or plan.value_use is CallStackValueUse8616.DISCARDED:
         statements.append(plan.call)
@@ -217,12 +293,50 @@ def _materialize_context(codegen: object, function: StackPointerCaptureFunction8
         result = locals_.create(plan.call.type)
         statements.append(c.CAssignment(result, plan.call, codegen=codegen))
         expression = result
-    statements.append(_sp_write(codegen, function, entry, plan.position.caller_after_offset))
+    if plan.position.caller_after_offset is not None:
+        statements.append(_sp_write(codegen, function, entry, plan.position.caller_after_offset))
     assert isinstance(entry.variable, SimTemporaryVariable)
     marker = CallStackInputBinding8616(plan.authority, entry.variable.tmp_id,
         tuple(_temporary_identity_8616(item) for item in iter(arguments)), _temporary_identity_8616(result) if result is not None else None)
     return c.CMultiStatementExpression(c.CStatements(statements, codegen=codegen), expression,
         codegen=codegen, tags={CALL_STACK_INPUT_BINDING_TAG_8616: marker})
+
+
+def _project_entry_only_final_call_8616(codegen, function, plans):
+    """Discard the nonexistent result of a proved terminal call at C tail."""
+    root = function.statements
+    if not isinstance(root, c.CStatements) or not root.statements:
+        return plans
+    tail = root
+    while isinstance(tail.statements[-1], c.CStatements) and tail.statements[-1].statements:
+        tail = tail.statements[-1]
+    final = tail.statements[-1]
+    if os.environ.get("INERTIA_TRACE_CALL_STACK_POSITION") == "1" and any(
+        item.position.caller_after_offset is None for item in plans
+    ):
+        logging.getLogger(__name__).warning(
+            "Entry-only tail input: final=%s rhs=%s type=%s",
+            type(final).__name__, type(getattr(final, "rhs", None)).__name__, type(function.functy).__name__,
+        )
+    if not isinstance(final, (c.CAssignment, c.CExpressionStatement)):
+        return plans
+    call = final.rhs if isinstance(final, c.CAssignment) else final.expr
+    plan = next((item for item in plans if item.call is call and item.position.caller_after_offset is None), None)
+    if plan is None or not isinstance(function.functy, SimTypeFunction):
+        return plans
+    if any(isinstance(node, c.CReturn) for node in _iter_c_nodes_deep_8616(root)):
+        return plans
+    if isinstance(final, c.CAssignment):
+        if not isinstance(final.lhs, c.CVariable) or call_stack_has_runtime_sp_8616(final.lhs):
+            return plans
+        tail.statements[-1] = c.CExpressionStatement(call, codegen=codegen, tags=final.tags)
+    proto = function.functy
+    function.functy = SimTypeFunction(
+        list(proto.args), SimTypeBottom(label="void").with_arch(codegen.project.arch),
+        arg_names=proto.arg_names, variadic=proto.variadic,
+    ).with_arch(codegen.project.arch)
+    return tuple(replace(item, value_use=CallStackValueUse8616.DISCARDED) if item is plan else item
+                 for item in plans)
 
 
 @cython.ccall
@@ -234,7 +348,13 @@ def _site_authority_8616(
     """Authenticate one CALL's position under universal or scoped evidence."""
     binding: object
     if scoped_context is None:
-        return prove_call_stack_position_8616(source, block.addr, index).proof
+        result = prove_call_stack_position_8616(source, block.addr, index)
+        if result.proof is None and os.environ.get("INERTIA_TRACE_CALL_STACK_POSITION") == "1":
+            logging.getLogger(__name__).warning(
+                "Stack position refused: function=%#x block=%#x call=%#x reason=%s",
+                source.function_addr, block.addr, block.instrs[index].addr, result.refusal,
+            )
+        return result.proof
     call = block.instrs[index]
     binding = scoped_context.for_callsite(call.addr)
     if binding is None:
@@ -327,27 +447,49 @@ def lower_call_stack_inputs_8616(
         codegen, source, scoped_context=scoped_context,
         scoped_caller_scope=scoped_caller_scope)
     allowed = (tuple((capture.assignment,)) if capture is not None else tuple(())) + tuple(wrappers)
-    if _has_unowned_sp(function.statements, allowed):
-        return _outcome(len(sites), 0, CallStackInputFailure8616.UNOWNED_SP_USE)
     value_uses = call_stack_value_uses_8616(function.statements)
     plans, failure = _collect_plans_8616(
         codegen, source, nodes, sites, value_uses, scoped_context, scoped_caller_scope)
     if failure is not None:
         return _outcome(len(sites), len(plans), failure)
+    terminal_plans = _terminal_stack_inputs_8616(source, nodes)
+    allowed += tuple(assignment for assignment, _, _ in terminal_plans)
+    if _has_unowned_sp(function.statements, allowed):
+        if os.environ.get("INERTIA_TRACE_CALL_STACK_POSITION") == "1":
+            logging.getLogger(__name__).warning(
+                "Unowned SP: function=%#x wrappers=%d capture=%s proven_call_sites=%d\n%s",
+                function.addr, len(wrappers), capture is not None, len(plans), function.c_repr(),
+            )
+        return _outcome(len(sites), 0, CallStackInputFailure8616.UNOWNED_SP_USE)
     if wrappers:
         valid = capture is not None and operator.eq(len(wrappers), len(plans))
         if valid and capture is not None:
-            valid = all(any(_existing_binding_is_current(codegen, function, wrapper, capture.value, plan.authority,
+            valid = all(
+                _same_c_expression_8616(helper.args[1], capture.value)
+                if proof.entry_sp_offset == 0 else
+                _same_c_expression_8616(helper.args[1], entry_stack_pointer_projection_8616(
+                    capture.value, proof.entry_sp_offset, codegen))
+                for _, helper, proof in terminal_plans
+            )
+            valid = valid and all(any(_existing_binding_is_current(codegen, function, wrapper, capture.value, plan.authority,
                                                          value_use=value_uses.get(id(wrapper), CallStackValueUse8616.UNKNOWN))
                             for wrapper in iter(wrappers)) for plan in iter(plans))
         return _outcome(len(sites), len(plans), None if valid else CallStackInputFailure8616.INVALID_BINDING,
                         classified=len(plans))
     captured = prepare_entry_stack_pointer_capture_8616(
-        codegen, source, tuple(plan.authority for plan in iter(plans)),
+        codegen, source,
+        (*tuple(plan.authority for plan in iter(plans)), *tuple(proof for _, _, proof in terminal_plans)),
         scoped_context=scoped_context,
         scoped_caller_scope=scoped_caller_scope)
     if captured is None or captured.failure is not None or captured.value is None:
         return _outcome(len(sites), len(plans), CallStackInputFailure8616.ENTRY_CAPTURE, classified=len(plans))
+    for _, helper, proof in terminal_plans:
+        args = list(helper.args)
+        args[1] = captured.value if proof.entry_sp_offset == 0 else entry_stack_pointer_projection_8616(
+            captured.value, proof.entry_sp_offset, codegen,
+        )
+        helper.args = args
+    plans = _project_entry_only_final_call_8616(codegen, function, plans)
     used = [node.variable.tmp_id for node in builtins.iter(_iter_c_nodes_deep_8616(function.statements))
             if isinstance(node, c.CVariable) and isinstance(node.variable, SimTemporaryVariable)]
     used.extend(var.tmp_id for var in iter(function.variables_in_use) if isinstance(var, SimTemporaryVariable))

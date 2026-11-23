@@ -940,6 +940,65 @@ def _validate_jcc_surface_8616(
     facts: object,
 ) -> BranchConditionIssue8616 | None:
     """Validate one materialized surface; return its issue or ``None``."""
+    from inertia.structuring.captured_condition_definitions import (
+        captured_byte_guard_8616, captured_word_compare_8616, promoted_stack_test_8616,
+    )
+    from inertia.structuring.condition_materialization import _first_tagged_ins_addr_8616
+
+    fact = facts[0]
+    candidate = candidates[0]
+    tags = _node_tags_8616(candidate)
+    stack_test = tags.get("inertia_structuring_promoted_stack_test_8616") is True
+    byte_guard = tags.get("inertia_structuring_captured_byte_guard_8616") is True
+    if stack_test or byte_guard:
+        for node in _iter_c_nodes_deep_8616(vctx.root):
+            if not isinstance(node, CIfElse) or len(node.condition_and_nodes) != 1:
+                continue
+            guard, body = node.condition_and_nodes[0]
+            if guard is not candidate:
+                continue
+            target = _first_tagged_ins_addr_8616(body)
+            taken, fallthrough = fact.taken_target, fact.fallthrough_target
+            if (
+                isinstance(target, int) and taken != fallthrough and target in (taken, fallthrough)
+                and (node.else_node is None or _first_tagged_ins_addr_8616(node.else_node) == (
+                    fallthrough if target == taken else taken
+                ))
+                and (
+                    (stack_test and promoted_stack_test_8616(guard, fact, body_is_taken=target == taken))
+                    or (byte_guard and captured_byte_guard_8616(
+                        vctx.root, node, guard, fact, body_is_taken=target == taken,
+                    ))
+                )
+            ):
+                return None
+            break
+    if _node_tags_8616(candidate).get("inertia_structuring_captured_loop_compare_8616") is True:
+        from inertia.structuring.condition_materialization import invert_structured_condition_8616
+        from inertia.structuring.existing_loop_exit_conditions import validate_captured_loop_compare_8616
+        from inertia.structuring.loop_break_topology import collect_loop_break_topology_8616
+
+        if validate_captured_loop_compare_8616(
+            vctx.root, candidate, fact,
+            collect_loop_break_topology_8616(vctx.codegen.project, vctx.codegen),
+            lambda condition: invert_structured_condition_8616(condition, vctx.codegen),
+        ):
+            return None
+    if _node_tags_8616(candidate).get("inertia_structuring_captured_word_compare_8616") is True:
+        for node in _iter_c_nodes_deep_8616(vctx.root):
+            if not isinstance(node, CIfElse) or node.else_node is not None or len(node.condition_and_nodes) != 1:
+                continue
+            guard, body = node.condition_and_nodes[0]
+            if guard is not candidate:
+                continue
+            target = _first_tagged_ins_addr_8616(body)
+            if (
+                isinstance(target, int) and fact.taken_target != fact.fallthrough_target
+                and target in {fact.taken_target, fact.fallthrough_target}
+                and captured_word_compare_8616(vctx.root, guard, fact, body_is_taken=target == fact.taken_target)
+            ):
+                return None
+            break
     expected_raw: object
     wide_verdict = validate_terminal_wide_condition_8616(
         vctx.codegen,

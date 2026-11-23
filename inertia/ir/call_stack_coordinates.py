@@ -29,10 +29,11 @@ import operator
 import builtins
 CallStackCoordinateSource8616 = typing.TypeVar("CallStackCoordinateSource8616")
 CalleeStackCallResult8616 = typing.TypeVar("CalleeStackCallResult8616")
+PrinceStartupDispatchPremise8616 = typing.TypeVar("PrinceStartupDispatchPremise8616")
 
 if TYPE_CHECKING:
     from inertia.semantics.call_stack_coordinate_source import CallStackCoordinateSource8616
-    from inertia.semantics.callee_stack_effects import CalleeStackCallResult8616
+    from inertia.semantics.callee_stack_effects import CalleeStackCallResult8616, PrinceStartupDispatchPremise8616
 
 __all__ = [
     "CALL_STACK_COORDINATE_SLOTS_8616",
@@ -177,7 +178,7 @@ class IRCallStackCoordinates8616:
     additional_return_bytes: int | None = None
     net_sp_delta: int | None = None
     argument_top: IRCallArgumentTop8616 | None = None
-    callee_sp_proof: CalleeStackCallResult8616 | None = None
+    callee_sp_proof: CalleeStackCallResult8616 | PrinceStartupDispatchPremise8616 | None = None
     source: CallStackCoordinateSource8616 | None = field(default=None, compare=False, repr=False)
     refusals: object = field(default=(), compare=True)
     raw_fact_count: cython.longlong = 0

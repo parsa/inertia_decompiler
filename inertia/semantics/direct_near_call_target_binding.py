@@ -370,8 +370,26 @@ def _target_in_all_fetch_windows_8616(head: cython.longlong, target: cython.long
     """
     minimum_selector = max(0, (head - 0xFFFF + 15) // 16)
     maximum_selector = min(0xFFFF, head // 16)
-    return (minimum_selector <= maximum_selector
-            and (maximum_selector << 4) <= target <= (minimum_selector << 4) + 0xFFFF)
+    if (minimum_selector <= maximum_selector
+            and (maximum_selector << 4) <= target <= (minimum_selector << 4) + 0xFFFF):
+        return True
+    from inertia.frontend.x86_16.opus_cs_census import census_selectors_8616
+
+    selectors = census_selectors_8616(head)
+    return bool(selectors) and all(
+        selector_fetches_near_call_8616(selector, head, target) for selector in selectors
+    )
+
+
+def selector_fetches_near_call_8616(selector: int, head: int, target: int) -> bool:
+    """Check one concrete CS: the callsite IP and the rel16 target IP are both in-segment.
+
+    Under CS=selector the CPU computes ``selector*16 + ((next_ip + disp) & 0xFFFF)``;
+    that equals the unwrapped linear ``target`` exactly when the target IP lies
+    in [0, 0xFFFF] relative to the same selector.
+    """
+    base = selector << 4
+    return 0 <= head - base <= 0xFFFF and 0 <= target - base <= 0xFFFF
 
 
 def _retained_coordinate_facts_8616(

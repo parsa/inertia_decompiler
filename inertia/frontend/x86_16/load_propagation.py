@@ -11,14 +11,16 @@ from __future__ import annotations
 import typing
 import cython
 
+from collections import Counter
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 
 from angr.ailment.block import Block
-from angr.ailment.expression import Expression, Load, Tmp
-from angr.ailment.statement import Assignment, SideEffectStatement, Store
+from angr.ailment.expression import Expression, Load, Tmp, VirtualVariable
+from angr.ailment.statement import Assignment, SideEffectStatement, Statement, Store
 from angr.code_location import AILCodeLocation
 from angr.utils.ssa import AILBlacklistExprTypeWalker
+from angr.utils.ssa.combined_uses_collector import VVarAndTmpUsesCollector
 import dataclasses
 import operator
 
@@ -33,6 +35,21 @@ class LoadPropagationStats8616:
     materialized_count: cython.longlong
     failure_count: cython.longlong
     refused_count: cython.longlong
+
+
+class _TmpOccurrenceCounter8616(VVarAndTmpUsesCollector):
+    """Count actual reads, including repeated uses of one node in a statement."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.counts: Counter[tuple[int, int]] = Counter()
+
+    def _handle_Tmp(
+        self, expr_idx: int, expr: Tmp, stmt_idx: int,
+        stmt: Statement | None, block: Block | None,
+    ) -> None:
+        """Record a read without collapsing repeated occurrences into a set."""
+        self.counts[(expr.tmp_idx, expr.bits)] += 1
 
 
 @cython.ccall
@@ -57,7 +74,7 @@ def refuse_reordered_loads_8616(
     blocks: Mapping[tuple[cython.longlong, int | None], Block],
     replacements: MutableMapping[AILCodeLocation, MutableMapping[Expression, Expression]],
 ) -> LoadPropagationStats8616:
-    """Filter load-bearing temporary substitutions in block and function models.
+    """Filter load-bearing SSA and temporary substitutions in block and function models.
 
     Refusal keeps the original temporary definition/use intact. It does not
     assert alias independence for distinct-looking addresses, nor collapse the
@@ -66,7 +83,7 @@ def refuse_reordered_loads_8616(
     ``has_load_expr`` classification of the replacement expression is keyed by
     object identity and reused only within this invocation, so mutation of an
     expression between invocations is always re-observed. Only ``new`` is
-    walked: ``old`` is already proven a ``Tmp`` leaf, so this matches walking
+    walked: ``old`` is already proven an SSA or temporary leaf, so this matches walking
     ``Assignment(None, old, new)`` exactly (``walk_expression`` is the upstream
     expression entrypoint, as used by ``has_ite_expr``).
     """
@@ -80,10 +97,11 @@ def refuse_reordered_loads_8616(
     inspected = refused = missing = 0
     walker = AILBlacklistExprTypeWalker((Load,))
     load_verdicts: dict[cython.longlong, tuple[Expression, cython.bint]] = {}
+    tmp_uses: dict[tuple[int, int | None], Counter[tuple[int, int]]] = {}
     for location, entries in replacements.items():
         block = blocks.get((location.block_addr, location.block_idx))
         for old, new in tuple(entries.items()):
-            if not isinstance(old, Tmp):
+            if not isinstance(old, (Tmp, VirtualVariable)):
                 continue
             cached = load_verdicts.get(id(new))
             if cached is not None and cached[0] is new:
@@ -98,6 +116,12 @@ def refuse_reordered_loads_8616(
             if not has_load:
                 continue
             inspected += 1
+            if isinstance(old, VirtualVariable):
+                # A register definition can remain observable at return even
+                # when native propagation sees just one scalar use.
+                del entries[old]
+                refused += 1
+                continue
             use_index = location.stmt_idx
             valid_location = block is not None and use_index is not None and 0 <= use_index < len(block.statements)
             if not valid_location:
@@ -106,7 +130,14 @@ def refuse_reordered_loads_8616(
                 refused += 1
                 continue
             assert block is not None and use_index is not None
-            if _has_memory_barrier_8616(block, old, use_index):
+            block_key = (location.block_addr, location.block_idx)
+            counts = tmp_uses.get(block_key)
+            if counts is None:
+                collector = _TmpOccurrenceCounter8616()
+                collector.walk(block)
+                counts = collector.counts
+                tmp_uses[block_key] = counts
+            if counts[(old.tmp_idx, old.bits)] != 1 or _has_memory_barrier_8616(block, old, use_index):
                 del entries[old]
                 refused += 1
     classified = inspected - missing

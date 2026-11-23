@@ -143,3 +143,51 @@ def prove_numeric_stack_pointer_assignment_8616(
         artifact.function_addr, block_addr, instruction_index, target.addr,
         destination.name, observer.coordinate,
     )
+
+
+@dataclass(frozen=True)
+class TerminalStackPointerInput8616:
+    """One return instruction's pre-pop SP relative to the function entry."""
+
+    function_addr: int
+    block_addr: int
+    instruction_addr: int
+    entry_sp_offset: int
+
+
+def prove_terminal_stack_pointer_input_8616(
+    artifact: IRFunctionArtifact, block_addr: int, instruction_addr: int,
+) -> TerminalStackPointerInput8616 | None:
+    """Read the must-state before any micro-operation of a terminal RET."""
+    blocks = {block.addr: block for block in artifact.blocks}
+    if (
+        artifact.refusals or len(blocks) != len(artifact.blocks)
+        or artifact.function_addr not in blocks
+        or any(block.refusals or any(succ not in blocks for succ in block.successor_addrs)
+               for block in artifact.blocks)
+    ):
+        return None
+    block = blocks.get(block_addr)
+    if block is None or not block.instrs or block.successor_addrs:
+        return None
+    terminal = block.instrs[-1]
+    if terminal.op != "RET" or terminal.addr != instruction_addr:
+        return None
+    start = next(i for i, insn in enumerate(block.instrs) if insn.addr == instruction_addr)
+    if any(insn.addr != instruction_addr for insn in block.instrs[start:]):
+        return None
+    states = _solve_stack_states(artifact)
+    predecessors = _predecessor_map(artifact)
+    incoming = tuple(states[pred] for pred in predecessors[block_addr])
+    if block_addr == artifact.function_addr:
+        incoming = (StackRestoreState8616(0), *incoming)
+    if not incoming:
+        return None
+    _, state = _transfer_block(
+        block_addr, block.instrs[:start], join_stack_restore_states_8616(incoming),
+    )
+    if state.sp_delta is None:
+        return None
+    return TerminalStackPointerInput8616(
+        artifact.function_addr, block_addr, instruction_addr, state.sp_delta,
+    )

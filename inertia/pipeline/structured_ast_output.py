@@ -31,7 +31,7 @@ from angr.sim_variable import SimVariable
 from archinfo import Arch
 from pyvex.arches import PyvexArch
 
-from inertia.ir.core import IRValue
+from inertia.ir.core import IRAddress, IRValue
 from inertia.ir.function_artifact import IRFunctionArtifact
 from inertia.ir.function_readiness_contracts import function_artifact_body_digest_8616
 from inertia.ir.raw_boot_blocked_prefix import _architecture_key_8616
@@ -353,6 +353,10 @@ class _StructuredASTEncoder8616:
             return owned_fact
         if isinstance(value, IRValue):
             return {"ir_value": value.to_dict()}
+        if isinstance(value, IRAddress):
+            # Typed segmented-address tags are owned IR facts; every field,
+            # including ``expr``, still goes through the strict walker.
+            return {"ir_address": self.encode(value.to_dict(), tuple(path) + ("ir_address",))}
         if isinstance(value, (IRFunctionArtifact, SSAFunctionArtifact)):
             digest = function_artifact_body_digest_8616(value)
             if digest is not None:

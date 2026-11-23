@@ -98,6 +98,28 @@ class ConditionalIndirectEdge8616:
     target_addr: cython.longlong
 
 
+@dataclasses.dataclass(frozen=True)
+class ConditionalDosExit8616:
+    """Decode a DOS AH=4Ch exit under an explicitly supplied DOS premise."""
+
+    block_addr: int
+    instruction_addr: int
+
+
+def _matches_conditional_dos_exit_8616(block, instructions, edge):
+    if edge.block_addr != block.addr or len(instructions) < 2:
+        return False
+    mov, interrupt = instructions[-2:]
+    encoded = bytes(mov.bytes)
+    return (
+        interrupt.address == edge.instruction_addr
+        and mov.address + mov.size == interrupt.address
+        and interrupt.address + interrupt.size == block.addr + block.size
+        and (encoded == b"\xb4\x4c" or (len(encoded) == 3 and encoded[0] == 0xb8 and encoded[2] == 0x4c))
+        and bytes(interrupt.bytes) == b"\xcd\x21"
+    )
+
+
 @dataclasses.dataclass(frozen=True, )
 class InstructionReachabilityEvidence8616:
     """Closed census of bounded binary basic-block reachability."""
@@ -115,7 +137,7 @@ class InstructionReachabilityEvidence8616:
     block_partition: FrontendBlockPartitionArtifact8616 | None = dataclass_field(
         default=None, compare=False, repr=False,
     )
-    conditional_edges: tuple[ConditionalIndirectEdge8616, ...] = ()
+    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalDosExit8616, ...] = ()
 
     @property
     def complete(self) -> cython.bint:
@@ -164,6 +186,15 @@ def _direct_target_8616(instruction: object) -> int | None:
         operands = tuple(inner.operands)
     except (AttributeError, TypeError):
         return None
+    if boundary.mnemonic == "ljmp":
+        # Capstone gives immediate far jumps as selector, then offset.
+        # Neither operand on its own is a linear branch target.
+        if len(operands) != 2 or any(operand.type != 2 for operand in operands):
+            return None
+        selector, offset = (operand.imm for operand in operands)
+        if not 0 <= selector <= 0xffff or not 0 <= offset <= 0xffff:
+            return None
+        return (selector << 4) + offset
     for operand in operands:
         if operand.type != 2:
             continue
@@ -202,6 +233,12 @@ def x86_16_block_successors_from_capstone_8616(
             return set(), True
     if not instructions:
         return set(), True
+    dos_exits = [edge for edge in iter(conditional_edges)
+                 if isinstance(edge, ConditionalDosExit8616) and edge.block_addr == boundary.addr]
+    if dos_exits:
+        return set(), len(dos_exits) != 1 or not _matches_conditional_dos_exit_8616(
+            boundary, instructions, dos_exits[0],
+        )
 
     last = cast(_InstructionBoundary8616, instructions[-1])
     return _terminal_successors_8616(
@@ -252,10 +289,15 @@ def _terminal_successors_8616(
         return successors, unresolved
     if mnemonic in {"jmp", "ljmp"}:
         target = _direct_target_8616(last)
-        if target is None and mnemonic == "jmp":
+        if target is None:
+            # A supplied far-indirect target is still only a decoding
+            # assumption. Keep the same pending IR obligation as for a
+            # near-indirect edge; the census alone proves neither CS nor
+            # the destination of the native transfer.
             terminal = cast(_InstructionBoundary8616, last)
             matches = tuple(edge for edge in iter(conditional_edges)
-                            if operator.eq(edge.block_addr, boundary.addr)
+                            if isinstance(edge, ConditionalIndirectEdge8616)
+                            and operator.eq(edge.block_addr, boundary.addr)
                             and operator.eq(edge.instruction_addr, terminal.address))
             if len(matches) == 1:
                 target = matches[0].target_addr
@@ -384,7 +426,12 @@ def collect_instruction_reachability_8616(
         region_end=region_end,
     )
     unresolved.update(fact.block_addr for fact in iter(partition.facts) if fact.failure is not None)
-    if any((edge.block_addr, edge.target_addr) not in successor_edges for edge in iter(conditional_edges)):
+    if any(
+        (edge.block_addr not in reachable_blocks or edge.block_addr in unresolved)
+        if isinstance(edge, ConditionalDosExit8616)
+        else (edge.block_addr, edge.target_addr) not in successor_edges
+        for edge in iter(conditional_edges)
+    ):
         # An unused assumption cannot silently disappear from its inventory.
         unresolved.add(entry)
     failure_count = len(unresolved)

@@ -21,11 +21,12 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CAssignment,
     CDirtyExpression,
     CExpression,
+    CWhileLoop,
     CStatements,
     CVariable,
 )
 from angr.sim_type import SimType, SimTypeChar, SimTypeLong, SimTypeShort
-from angr.sim_variable import SimTemporaryVariable, SimVariable
+from angr.sim_variable import SimMemoryVariable, SimTemporaryVariable, SimVariable
 from archinfo import Arch
 
 from inertia.lowering.c_ast_utils import (
@@ -236,12 +237,52 @@ def _capture_plan(
         None,
     )
     if dominating is None:
+        if _is_loop_state_update_8616(scan, assignment, identity, total):
+            return None
         raise PipelineHardError(f"GP version capture: identity={identity!r}: definition does not dominate every read")
     if not isinstance(assignment.lhs, CDirtyExpression) and not _outlives_register_value(
         scan, dominating, assignment, identity,
     ):
         return None
     return _CapturePlan8616(identity, assignment, group, cast(CVariable | CDirtyExpression, assignment.lhs))
+
+
+def _is_loop_state_update_8616(scan, assignment, identity, total):
+    """Keep a coalesced loop value in its architectural lane across iterations."""
+    if (
+        not isinstance(assignment.lhs, CVariable)
+        or not isinstance(assignment.tags.get("vex_stmt_idx"), int)
+        or not scan.statement_reads(assignment.rhs, identity)
+    ):
+        return False
+    parent = scan.classify(assignment.lhs)[1]
+    # A dirty definition can reserve the whole parent for snapshot lowering,
+    # in which case this loop could not use the architectural lane.
+    for node in _iter_c_nodes_deep_8616(scan.root):
+        if isinstance(node, CAssignment) and isinstance(node.lhs, CDirtyExpression):
+            target = scan.classify(node.lhs)
+            if target is not None and target[1] == parent:
+                return False
+    for loop in _iter_c_nodes_deep_8616(scan.root):
+        if not isinstance(loop, CWhileLoop) or scan.statement_reads(loop, identity) != total:
+            continue
+        if scan.clobbers(loop):
+            continue
+        nodes = tuple(_iter_c_nodes_deep_8616(loop))
+        if not any(node is assignment for node in nodes):
+            continue
+        for node in nodes:
+            if not isinstance(node, CAssignment) or node is assignment:
+                continue
+            target = scan.classify(node.lhs)
+            if target is not None and target[1] == parent:
+                break
+            if isinstance(node.lhs, CVariable) and isinstance(node.lhs.variable, SimMemoryVariable):
+                if node.lhs.variable.category == "inertia_gp_register_state":
+                    break
+        else:
+            return True
+    return False
 
 
 @cython.ccall

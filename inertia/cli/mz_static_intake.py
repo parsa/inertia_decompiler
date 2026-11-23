@@ -65,8 +65,25 @@ from inertia.ir.real16_declared_interrupt8616 import (
 from inertia.lowering.analysis_helpers import (
     resolve_direct_call_target_from_instruction_8616,
 )
+from inertia.frontend.x86_16.frontend_direct_callsite_index import DecodedFarCallTarget8616
 import dataclasses
 import operator
+
+
+def _resolve_mz_index_call_target_8616(
+    project: object, instruction: object,
+) -> int | DecodedFarCallTarget8616 | None:
+    """Preserve exact far CALL identity in the invocation index."""
+    encoding = bytes(instruction.bytes)
+    mnemonic = str(instruction.mnemonic).lower()
+    if mnemonic == "lcall" and len(encoding) == 5 and encoding[0] == 0x9A:
+        offset = int.from_bytes(encoding[1:3], "little")
+        selector = int.from_bytes(encoding[3:5], "little")
+        target = selector * 16 + offset
+        return DecodedFarCallTarget8616(target) if target <= 0xFFFFF else None
+    if mnemonic == "call" and len(encoding) == 3 and encoding[0] == 0xE8:
+        return resolve_direct_call_target_from_instruction_8616(project, instruction)
+    return None
 
 __all__ = [
     "MzStaticIntakeInstall8616",
@@ -871,7 +888,7 @@ def install_mz_static_invocation_source_8616(
         return bound
     boot, boot_recompute, services = bound
     resolver: DirectCallTargetResolver8616 = (
-        partial(resolve_direct_call_target_from_instruction_8616, project)
+        partial(_resolve_mz_index_call_target_8616, project)
         if direct_target_resolver is None
         else direct_target_resolver
     )

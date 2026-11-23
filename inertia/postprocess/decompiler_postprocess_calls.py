@@ -11383,6 +11383,7 @@ class _CallsiteStackArgsMaterializer8616:
             None,
             [segment_expr, address_expr],
             codegen=self.codegen,
+            tags={"inertia_x86_16_runtime_segment_helper": helper},
         )
     def _direct_expr_expr_ops_8616(self,
         source: StructuredAstValue,
@@ -12795,6 +12796,18 @@ class _CallsiteStackArgsMaterializer8616:
             push_sources[arg_idx] if isinstance(push_sources, tuple) and arg_idx < len(push_sources) else None
         )
         source_expr = self._stack_call_source_expr_8616(push_source, arg_idx, call_name=call_name)
+        if (
+            source_expr is not None
+            and isinstance(push_source, tuple) and len(push_source) == 4
+            and push_source[0] == CallsitePushSourceKind8616.SEGMENTED_INDIRECT_VALUE.value
+            and isinstance(push_source[3], tuple) and len(push_source[3]) == 2
+            and push_source[3][0] == CallsitePushSourceKind8616.REGISTER_VALUE.value
+            and _call_arg_semantic_key_8616(rhs) == _call_arg_semantic_key_8616(source_expr)
+        ):
+            # The decoded adjacent PUSH owns this live register read.
+            # Do not replace the load with an unrelated dirty SP carrier.
+            normalized.append(self._clone_c_ast_tree(source_expr))
+            return True
         if (
             source_expr is not None
             and isinstance(rhs, structured_c.CVariable)

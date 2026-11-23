@@ -184,6 +184,56 @@ class DecodedDirectCallsite8616:
         return next_addr, next_addr + displacement
 
 
+    def encoded_far_coordinates(self) -> object:
+        """Decode continuation and linear target of an unprefixed ``9A`` CALL FAR.
+
+        The pointer operand is read from the retained (loader-relocated)
+        instruction bytes; the linear target ``seg * 16 + off`` must equal the
+        indexed ``target_addr`` or the callsite stays unresolved.
+        """
+        if (not self.is_far or type(self.instruction_index) is not int
+                or not 0 <= self.instruction_index < len(self.instructions)):
+            return None
+        instruction = cast(_NativeCallsiteInstruction8616,
+                           self.instructions[self.instruction_index])
+        try:
+            address = instruction.address
+            size = instruction.size
+            encoding = bytes(instruction.bytes)
+        except (AttributeError, TypeError):
+            return None
+        if (type(address) is not int or operator.ne(address, self.callsite_addr)
+                or type(size) is not int or size != 5):
+            return None
+        if len(encoding) != 5 or encoding[0] != 0x9A:
+            return None
+        offset = int.from_bytes(encoding[1:3], "little")
+        segment = int.from_bytes(encoding[3:5], "little")
+        linear_target = segment * 16 + offset
+        if operator.ne(linear_target, self.target_addr):
+            return None
+        return address + size, linear_target
+
+    def bound_far_transfer(self, project):
+        """Return the immediate callee CS:IP without assuming caller reachability."""
+        from inertia.semantics.callee_stack_effects import bind_immediate_far_call_site_8616
+
+        coordinates = self.encoded_far_coordinates()
+        if coordinates is None:
+            return None
+        continuation, target = coordinates
+        transfer = bind_immediate_far_call_site_8616(
+            project, callsite_addr=self.callsite_addr, target_addr=target, return_addr=continuation,
+        )
+        if transfer is None:
+            return None
+        retained = bytes(self.instructions[self.instruction_index].bytes)
+        if (int.from_bytes(retained[3:5], "little") != transfer.callee_cs
+            or int.from_bytes(retained[1:3], "little") != transfer.callee_ip):
+            return None
+        return transfer
+
+
     def bound_near_coordinates(
         self, boundary: ExactFunctionRangeBoundary8616,
     ) -> object:
@@ -342,6 +392,18 @@ def build_decoded_direct_callsite_index_8616(
             if not isinstance(target_addr, int):
                 continue
             raw_fact_count += 1
+            if not is_far:
+                encoding = getattr(instruction, "bytes", None)
+                if isinstance(encoding, (bytes, bytearray)) and len(encoding) == 5 and encoding[0] == 0x9A:
+                    # Some resolver lanes expose only the lifted linear
+                    # constant. Retain the machine opcode's frame kind.
+                    native_target = (int.from_bytes(encoding[3:], "little") << 4) + int.from_bytes(
+                        encoding[1:3], "little",
+                    )
+                    if target_addr != native_target:
+                        failure_count += 1
+                        continue
+                    is_far = True
             callsite_addr = instruction_address_resolver(instruction)
             if not isinstance(callsite_addr, int):
                 failure_count += 1

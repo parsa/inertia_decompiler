@@ -26,6 +26,7 @@ from inertia.frontend.x86_16.frontend_boundary_transport import (
     restore_function_boundary_8616,
 )
 from inertia.frontend.x86_16.frontend_function_boundary import ExactFunctionRangeBoundary8616
+from inertia.frontend.x86_16.frontend_instruction_reachability import ConditionalDosExit8616, ConditionalIndirectEdge8616
 from inertia.frontend.x86_16.function_knowledge_base import function_knowledge_base_8616
 from inertia.ir.analysis.alias import storage_of
 from inertia.ir.analysis.stack_frame_ir import build_x86_16_ir_frame_access_artifact
@@ -1764,7 +1765,21 @@ def _lift_x86_16_function_surface_8616(
     proven_return_block_addrs: frozenset[cython.longlong] = frozenset()
     pending_indirect_blocks: frozenset[cython.longlong] = frozenset()
     if isinstance(function, ExactFunctionRangeBoundary8616):
-        pending_indirect_blocks = frozenset(edge.block_addr for edge in iter(function.conditional_edges))
+        pending_indirect_blocks = frozenset(edge.block_addr for edge in iter(function.conditional_edges)
+                                            if isinstance(edge, ConditionalIndirectEdge8616))
+        for edge in iter(function.conditional_edges):
+            if isinstance(edge, ConditionalDosExit8616):
+                from .dos_exit_evidence import prove_modeled_dos_exit_8616
+
+                exit_evidence = prove_modeled_dos_exit_8616(project, function, edge)
+                detail = (
+                    "DOS model termination not established"
+                    if exit_evidence is None else
+                    f"DOS model exits with status {exit_evidence.status if exit_evidence.status is not None else 'AL'}; invocation authority still required"
+                )
+                refusals.append(IRRefusal(
+                    "dos_exit_premise_pending", detail, edge.block_addr,
+                ))
         exact_block_sizes = {
             _block_addr(block): _external_int(cast(_BlockBoundary, block).size)
             for block in iter(function.blocks)

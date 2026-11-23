@@ -443,6 +443,54 @@ class _SegmentStateScan8616:
         return self._transform_cvar(node)
 
 
+def _inputs_precede_first_call_8616(root: object, captured_ids: object) -> cython.bint:
+    """Return whether every captured input use executes before any CALL.
+
+    Only an ordered top-level statement list qualifies. Every captured node
+    must lie in the straight-line prefix ahead of the first statement that
+    contains an effectful call, and that prefix must hold no label, goto or
+    loop that could re-enter it after the call. A CALL cannot change a value
+    read before it executes, so no cross-call origin proof is needed.
+    """
+    if not isinstance(root, structured_c.CStatements):
+        return False
+    remaining = set(captured_ids)
+
+    def ordered(statements: object) -> object:
+        for item in statements:
+            if isinstance(item, structured_c.CStatements):
+                yield from ordered(item.statements)
+            else:
+                yield item
+
+    for statement in ordered(root.statements):
+        if contains_effectful_call_8616(statement):
+            call = statement.expr if isinstance(statement, structured_c.CExpressionStatement) else (
+                statement.rhs if isinstance(statement, structured_c.CAssignment) else None)
+            if isinstance(call, structured_c.CFunctionCall):
+                # The call's own target and arguments are evaluated before
+                # control transfers, so input reads there precede the CALL.
+                operands = (call.callee_target, *(call.args or ()))
+                for operand in operands:
+                    if operand is None:
+                        continue
+                    nested = (operand, *_iter_c_nodes_deep_8616(operand))
+                    if any(isinstance(node, structured_c.CFunctionCall) for node in nested):
+                        return False
+                    remaining.difference_update(id(node) for node in nested)
+            return not remaining
+        subtree = (statement, *_iter_c_nodes_deep_8616(statement))
+        if any(
+            isinstance(node, (structured_c.CGoto, structured_c.CLabel,
+                              structured_c.CWhileLoop, structured_c.CDoWhileLoop,
+                              structured_c.CForLoop))
+            for node in subtree
+        ):
+            return False
+        remaining.difference_update(id(node) for node in subtree)
+    return not remaining
+
+
 def _capture_segment_entry_versions_8616(
     codegen: object,
     function: _CFunctionSegmentRegisters8616,
@@ -487,11 +535,23 @@ def _capture_segment_entry_versions_8616(
             captured_ids.add(id(node))
     if not sources:
         return set()
-    if contains_effectful_call_8616(root):
+    if contains_effectful_call_8616(root) and not _inputs_precede_first_call_8616(root, captured_ids):
         raise PipelineHardError(
             "segment input origin across CALL is unproven",
             layer="Types", function_addr=function.addr,
-            details=_SegmentInputCaptureFailure8616.CALL_BOUNDARY_UNPROVEN,
+            details={
+                "failure": _SegmentInputCaptureFailure8616.CALL_BOUNDARY_UNPROVEN.value,
+                "captured_segments": sorted({
+                    name for variable in sources
+                    if (name := _physical_segment_name_8616(variable, project)) is not None
+                }),
+                "captured_reference_count": len(captured_ids),
+                "tagged_callsites": sorted({
+                    address for node in nodes
+                    if isinstance(node, structured_c.CFunctionCall)
+                    and isinstance(address := (node.tags or {}).get("ins_addr"), int)
+                }),
+            },
         )
     if not isinstance(root, structured_c.CStatements):
         raise PipelineHardError(

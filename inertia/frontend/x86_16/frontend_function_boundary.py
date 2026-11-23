@@ -17,6 +17,7 @@ from typing import Protocol, cast
 
 from .frontend_capstone_block import DirectCapstoneBlock8616
 from .frontend_instruction_reachability import (
+    ConditionalDosExit8616,
     ConditionalIndirectEdge8616,
     collect_instruction_reachability_8616,
 )
@@ -57,7 +58,7 @@ class ExactFunctionRangeBoundary8616:
     )
 
     decode_lower_bound: int | None = None
-    conditional_edges: tuple[ConditionalIndirectEdge8616, ...] = ()
+    conditional_edges: tuple[ConditionalIndirectEdge8616 | ConditionalDosExit8616, ...] = ()
 
     @property
     def decode_start(self) -> cython.longlong:

@@ -32,7 +32,7 @@ from inertia.frontend.x86_16.relative_control_edge import (
     DecodedRelativeEdge,
     RelativeEdgeForm,
     decode_relative_edge,
-    invariant_relative_destination,
+    bounded_relative_destination,
 )
 
 from .core import IRRefusal
@@ -590,6 +590,7 @@ def terminal_direct_jump_evidence_8616(
     instruction_size: int | None,
     tmp_exprs: Mapping[cython.longlong, object],
     type_environment: object | None = None,
+    selector_bounds: tuple[int, int] = (0, 0xFFFF),
 ) -> TerminalJumpEvidence8616:
     """Evaluate one ``Ijk_Boring`` block tail as a native direct jump.
 
@@ -598,6 +599,8 @@ def terminal_direct_jump_evidence_8616(
     A loader-linear destination is published only when the ``next`` operand
     is the lifter's composition for the same decoded edge and the resulting
     target is invariant under the instruction's selector fetch window.
+    Explicit bounds apply only to this invocation; the caller must bind them
+    to the exact instruction and image before use. The default is universal.
     Non-jump terminals and missing byte evidence return ``retain=False``
     with a closed zero classification; the instruction's IR effects already
     carry its semantics, so absence of the marker is not a dropped fact.
@@ -645,7 +648,7 @@ def terminal_direct_jump_evidence_8616(
             stats=TerminalJumpEvidenceStats8616(1, 1, 0, 0, 0),
         )
     return _proven_terminal_target_8616(
-        decoded, next_expr, tmp_exprs, type_environment, block_addr,
+        decoded, next_expr, tmp_exprs, type_environment, block_addr, selector_bounds,
     )
 
 
@@ -656,19 +659,24 @@ def _proven_terminal_target_8616(
     tmp_exprs: Mapping[cython.longlong, object],
     type_environment: object | None,
     block_addr: int | None,
+    selector_bounds: tuple[int, int] = (0, 0xFFFF),
 ) -> TerminalJumpEvidence8616:
     """Prove the decoded jump's loader-linear destination or refuse it."""
     constant_next: object
     linear_target: object
     shape: object
-    destination = invariant_relative_destination(decoded)
+    destination = bounded_relative_destination(decoded, selector_bounds[0], selector_bounds[1])
     linear_target = destination.target
     if linear_target is None:
         return _evidence_8616(
             retain=True, proven_target=None,
             failure=TerminalJumpRefusalReason8616.SELECTOR_WINDOW_UNPROVED,
             block_addr=block_addr, classified=True,
-            detail=f"relative destination is unresolved: {destination.verdict.value}",
+            detail=(
+                f"relative destination is unresolved: {destination.verdict.value}; "
+                f"CS interval {destination.selector_min:#06x}..{destination.selector_max:#06x}; "
+                f"possible loader targets {tuple(hex(target) for target in destination.alternatives)}"
+            ),
             decoded=decoded,
         )
     constant_next = _const_value_8616(next_expr)

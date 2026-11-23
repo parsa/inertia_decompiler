@@ -26,7 +26,7 @@ import operator
 
 _Chunks8616 = typing.TypeAliasType("_Chunks8616", Generator[tuple[str, object]])
 _BinaryRenderer8616 = typing.TypeAliasType("_BinaryRenderer8616", Callable[[CBinaryOp, str], _Chunks8616])
-_GROUPED_OPERATORS = frozenset({"And", "Or", "Xor", "Shl", "Shr", "Sar", "LogicalOr"})
+_GROUPED_OPERATORS = frozenset({"And", "Or", "Xor", "Shl", "Shr", "Sar", "LogicalOr", "CmpEQ", "CmpNE"})
 
 
 class _NamedRenderer8616(Protocol):
@@ -39,6 +39,7 @@ def _operand_chunks_8616(parent: CBinaryOp, expression: CExpression) -> _Chunks8
     """Group a binary operand without mutating its expression or chunk owners."""
     group = isinstance(expression, CBinaryOp) and (
         parent.op_precedence > expression.op_precedence
+        or (parent.op in {"CmpEQ", "CmpNE"} and expression.op in {"CmpEQ", "CmpNE"})
         or (parent.op in {"And", "Or", "Xor"} and operator.ne(expression.op, parent.op))
         or (parent.op in {"Shl", "Shr", "Sar"} and expression.op in {"Add", "Sub"})
         or (parent.op == "LogicalOr" and expression.op == "LogicalAnd")
@@ -68,4 +69,18 @@ def apply_codegen_parentheses_8616() -> None:
         yield op, self
         yield from _operand_chunks_8616(self, self.rhs)
 
+    original_ne = CBinaryOp._c_repr_chunks_cmpne
+
+    def _cmpne_chunks_8616(self: CBinaryOp) -> _Chunks8616:
+        """Keep a bitmask comparison boolean when nested in another expression."""
+        if (
+            self.codegen.project.arch.name == "86_16"
+            and isinstance(self.lhs, CBinaryOp)
+            and self.lhs.op in {"And", "Or", "Xor"}
+        ):
+            yield from self._c_repr_chunks(" != ")
+        else:
+            yield from original_ne(self)
+
     CBinaryOp._c_repr_chunks = _binary_chunks_8616
+    CBinaryOp._c_repr_chunks_cmpne = _cmpne_chunks_8616

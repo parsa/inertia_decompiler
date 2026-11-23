@@ -27,6 +27,7 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CIfBreak,
     CIfElse,
     CStatements,
+    CVariable,
     CWhileLoop,
 )
 
@@ -36,6 +37,7 @@ from inertia.pipeline.errors import PipelineHardError
 from inertia.structuring.condition_call_effects import classify_condition_call_effects_8616
 
 from .condition_ownership import requires_composite_condition_ownership_8616
+from .captured_condition_definitions import captured_byte_compare_expression_8616
 from .loop_break_topology import LoopBreakTopology8616
 from .loop_condition_identity import is_owned_loop_continuation_8616
 from .multi_arm_condition_ownership import first_statement_block_8616
@@ -213,10 +215,11 @@ def _replace_guard_8616(
     lower: Callable[[ConditionIR], CExpression | None],
     invert: Callable[[CExpression], CExpression],
     record_precision: Callable[[CExpression, CExpression], cython.bint],
+    captured: CExpression | None = None,
 ) -> cython.bint:
     """Publish one CFG-proven replacement without altering the break body."""
     replacement: object
-    replacement = lower(fact)
+    replacement = lower(fact) if captured is None else captured
     if replacement is None:
         raise PipelineHardError(f"classified loop-exit condition jcc={fact.src_insn:#x} could not be lowered")
     if not polarity:
@@ -227,6 +230,8 @@ def _replace_guard_8616(
         "vex_block_addr": fact.block_addr,
         "inertia_structuring_condition_cfg_materialized_8616": True,
     }
+    if captured is not None:
+        replacement.tags["inertia_structuring_captured_loop_compare_8616"] = True
     already_owned = current.tags.get("inertia_structuring_condition_cfg_materialized_8616") is True
     if already_owned and _same_c_expression_8616(current, replacement):
         return False
@@ -275,7 +280,8 @@ def materialize_existing_loop_exit_conditions_8616(
             if polarity is None:
                 continue
             materialized += 1
-            replaced = _replace_guard_8616(guard, current, fact, polarity, lower, invert, record_precision)
+            captured = captured_byte_compare_expression_8616(node.body, guard, fact)
+            replaced = _replace_guard_8616(guard, current, fact, polarity, lower, invert, record_precision, captured)
             changed += replaced
             if replaced:
                 replacement = guard.condition if isinstance(guard, CIfBreak) else guard.condition_and_nodes[0][0]
@@ -283,3 +289,36 @@ def materialize_existing_loop_exit_conditions_8616(
                 # the proven exit predicate. Publish both exact AST views.
                 record_precision(invert(current), invert(replacement))
     return ExistingLoopExitStats8616(raw, normalized, materialized, materialized, raw - materialized, changed)
+
+
+def validate_captured_loop_compare_8616(root, candidate, fact, topology, invert):
+    """Rebind the final guard to the capture and verify its CFG polarity."""
+    if topology is None:
+        return False
+    for loop in _iter_c_nodes_deep_8616(root):
+        if not isinstance(loop, (CWhileLoop, CForLoop, CDoWhileLoop)):
+            continue
+        for guard, current in _local_guards_8616(loop.body):
+            if current is not candidate:
+                continue
+            owner = _loop_owner_8616(loop, topology)
+            if owner is None:
+                continue
+            polarity = _exit_polarity_8616(fact, owner, topology)
+            if polarity is None:
+                continue
+            expected = captured_byte_compare_expression_8616(loop.body, guard, fact)
+            if expected is None:
+                continue
+            expected = expected if polarity else invert(expected)
+            if not _same_c_expression_8616(candidate, expected):
+                continue
+            uses = [node for node in _iter_c_nodes_deep_8616(candidate) if isinstance(node, CVariable)]
+            bound = [node for node in _iter_c_nodes_deep_8616(expected) if isinstance(node, CVariable)]
+            if len(uses) == len(bound) == 1 and (
+                uses[0].variable is bound[0].variable
+                and uses[0].unified_variable is bound[0].unified_variable
+                and uses[0].type.size == bound[0].type.size == 8
+            ):
+                return True
+    return False

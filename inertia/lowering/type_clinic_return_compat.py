@@ -30,6 +30,7 @@ from angr.analyses.complete_calling_conventions import CompleteCallingConvention
 from angr.analyses.decompiler.callsite_maker import CallSiteMaker
 from angr.analyses.decompiler.clinic import Clinic
 from angr.analyses.decompiler.decompiler import Decompiler
+from angr.analyses.reaching_definitions import ReachingDefinitionsAnalysis
 from angr.knowledge_plugins.functions.function import PrototypeSource
 
 from inertia.lowering.authoritative_function_prototypes import (
@@ -45,6 +46,7 @@ from inertia.lowering.unused_void_return_types import (
 )
 from inertia.semantics.callsite_summary import CallerReturnUseVerdict8616
 from inertia.semantics.terminal_register_returns import collect_terminal_ax_return_evidence_8616
+from inertia.semantics.terminal_value_roles import TerminalAxReturnLane8616
 import dataclasses
 
 __all__ = [
@@ -146,6 +148,19 @@ def _bind_clinic_calling_convention_kb_8616() -> None:
             self.kb = scope.kb
         cast(Any, original_callsite)(self, *args, **kwargs)
 
+    original_rda = ReachingDefinitionsAnalysis.__init__
+
+    def _rda_init_8616(self: ReachingDefinitionsAnalysis, subject: object, *args: object, **kwargs: object) -> None:
+        """Bind nested RDA only when its subject belongs to this live Clinic KB."""
+        scope: object
+        scope = _CLINIC_CALLING_CONVENTION_SCOPE_8616.get()
+        address = getattr(subject, "addr", None)
+        if (scope is not None and self.project is scope.project and isinstance(address, int)
+                and scope.kb.functions.get(address) is subject):
+            self.kb = scope.kb
+        cast(Any, original_rda)(self, subject, *args, **kwargs)
+
+    cast(Any, ReachingDefinitionsAnalysis).__init__ = _rda_init_8616
     cast(Any, CompleteCallingConventionsAnalysis).__init__ = _init_8616
     cast(Any, CallingConventionAnalysis).__init__ = _callsite_init_8616
     _CCA_INIT_PATCHED_8616 = True
@@ -288,6 +303,25 @@ def collect_clinic_terminal_return_evidence_8616(graph: object) -> TerminalRetur
 
 
 @cython.ccall
+def _terminal_ax_untouched_8616(terminal_ax_evidence: object) -> cython.bint:
+    """Return whether every censused terminal path leaves AX (and DX:AX) unwritten."""
+    states = getattr(terminal_ax_evidence, "storage_states", None)
+    return (
+        bool(states)
+        and terminal_ax_evidence.failure_count == 0
+        and terminal_ax_evidence.raw_fact_count > 0
+        and terminal_ax_evidence.materialized_count == terminal_ax_evidence.raw_fact_count
+        and all(
+            state.ax_lanes is TerminalAxReturnLane8616.NONE
+            and state.call_output_lanes is TerminalAxReturnLane8616.NONE
+            and state.local_pointer_output_lanes is TerminalAxReturnLane8616.NONE
+            and not state.dx_ax_pair_proven
+            for state in iter(states)
+        )
+    )
+
+
+@cython.ccall
 def finalize_clinic_return_type_8616(
     project: object,
     function: object,
@@ -307,6 +341,16 @@ def finalize_clinic_return_type_8616(
         and not terminal_ax_evidence.proves_missing_value_path
         and not terminal_ax_evidence.proves_local_pointer_output_carrier
     )
+    if (
+        observation is None
+        and evidence.proves_no_terminal_value
+        and not tuple(cast(Any, function).get_call_sites())
+        and _terminal_ax_untouched_8616(terminal_ax_evidence)
+    ):
+        # AX is never written on any terminal path, so every caller observes
+        # its own pre-call AX: no callee result exists for any caller to use.
+        # Call-free only: a callee's AX would otherwise flow out unmodelled.
+        observation = CallerReturnUseVerdict8616.UNUSED
     result = materialize_unused_caller_void_return_type_8616(
         project,
         function,

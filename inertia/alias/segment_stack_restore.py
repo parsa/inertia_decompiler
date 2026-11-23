@@ -396,7 +396,12 @@ def _call_exit_state_8616(
     )
     if overlay is not None:
         entry_sp = instruction_entry_state.sp_delta
-        return (None if entry_sp is None else entry_sp + overlay), {}, None
+        bp_after = None
+        sp_overlay = getattr(overlay, "sp_delta", overlay)
+        if getattr(overlay, "bp_preserved", False):
+            # Whole-body nested proof: the callee restores BP on every return.
+            bp_after = instruction_entry_state.bp_delta
+        return (None if entry_sp is None else entry_sp + sp_overlay), {}, bp_after
     return _call_effect_stack_state_8616(instruction, instruction_entry_state)
 
 

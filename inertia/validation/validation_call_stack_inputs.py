@@ -40,6 +40,9 @@ from inertia.lowering.call_stack_input_contracts import (
     current_call_stack_source_8616,
     direct_call_target_8616,
 )
+from inertia.lowering.call_stack_inputs import _terminal_stack_inputs_8616
+from inertia.lowering.far_return_boundary_carriers import _loaded_word_far_return_layout_8616
+from inertia.lowering.segment_register_state import runtime_segment_name_for_variable_8616
 from inertia.lowering.call_stack_value_uses import CallStackValueUse8616, call_stack_value_uses_8616
 from inertia.lowering.entry_stack_pointer_capture import (
     EntryStackPointerCaptureObservation8616,
@@ -49,7 +52,9 @@ from inertia.lowering.entry_stack_pointer_capture import (
 )
 from inertia.lowering.gp_register_state import runtime_gp_expression_view_8616
 from inertia.semantics.callsite_summary import structured_callsite_addr_8616
+from inertia.semantics.callee_stack_effects import bind_immediate_far_call_site_8616
 import dataclasses
+import os
 import operator
 import builtins
 
@@ -205,17 +210,111 @@ def _verify_context(codegen: object, wrapper: c.CMultiStatementExpression, sourc
         return None
     if operator.ne(structured_callsite_addr_8616(layout.call), position.callsite_addr) or operator.ne(direct_call_target_8616(codegen, layout.call), position.target_addr):
         return None
-    if not _sp_write(layout.pre_write, marker.entry_tmp_id, position.callee_entry_offset):
+    site = (bind_immediate_far_call_site_8616(
+        codegen.project, callsite_addr=position.callsite_addr,
+        target_addr=position.target_addr, return_addr=position.return_addr,
+    ) if position.return_frame_bytes == 4 and os.getenv("INERTIA_EXPERIMENTAL_WORD_FAR_RETURN") == "1" else None)
+    if site is not None:
+        if not _verify_far_call_write_8616(layout.pre_write, marker.entry_tmp_id, position, site):
+            return None
+    elif not _sp_write(layout.pre_write, marker.entry_tmp_id, position.callee_entry_offset):
         return None
-    if not _sp_write(layout.post_write, marker.entry_tmp_id, position.caller_after_offset):
+    if position.caller_after_offset is None:
+        if layout.post_write is not None:
+            return None
+    elif not _sp_write(layout.post_write, marker.entry_tmp_id, position.caller_after_offset):
         return None
     logical = copy(layout.call)
     logical.args = list(layout.original_arguments)
     return _VerifiedContext8616(wrapper, marker, logical)
 
 
+def _verify_far_call_write_8616(assignment, entry_id, position, site):
+    """Check actual helper operands and independently prove both SP lanes."""
+    lhs = runtime_gp_expression_view_8616(assignment.lhs)
+    rhs = assignment.rhs
+    if lhs is None or lhs.register_name != "esp" or not isinstance(rhs, c.CBinaryOp) or rhs.op != "Or":
+        return False
+    low = rhs.rhs
+    if (not isinstance(low, c.CBinaryOp) or low.op != "And"
+        or not isinstance(low.rhs, c.CConstant) or low.rhs.value != 0xffff):
+        return False
+    helper = low.lhs
+    if isinstance(helper, c.CTypeCast) and call_stack_value_size_8616(helper.dst_type) == 2:
+        helper = helper.expr
+    if (not isinstance(helper, c.CFunctionCall) or helper.callee_target != "inertia_call_far_linear"
+        or len(helper.args or ()) != 5):
+        return False
+    ss, pre_sp, *constants = helper.args
+    if not isinstance(ss, c.CVariable) or runtime_segment_name_for_variable_8616(ss.variable) != "ss":
+        return False
+    if any(not isinstance(arg, c.CConstant) or arg.value != expected for arg, expected in
+           zip(constants, (site.return_addr, site.callee_cs, site.callee_ip), strict=True)):
+        return False
+    entry, current = z3.BitVecs("far_call_entry_esp far_call_current_esp", 32)
+    equation = _SpEquation8616(entry_id, entry, current)
+    high, before = _sp_value(rhs.lhs, equation), _sp_value(pre_sp, equation)
+    if high is None or before is None:
+        return False
+    solver = z3.Solver()
+    solver.set(timeout=1000)
+    solver.add(z3.Or(high != (current & 0xffff0000),
+                     ((before - 4) & 0xffff) != ((entry + position.callee_entry_offset) & 0xffff)))
+    return solver.check() == z3.unsat
+
+
+def _verified_terminal_writes_8616(codegen, source, root, capture):
+    """Check the loaded RETF and the actual SS, pre-pop SP and ESP publication."""
+    if capture is None:
+        return ()
+    entry, current = z3.BitVecs("terminal_entry_esp terminal_current_esp", 32)
+    equation = _SpEquation8616(capture.value.variable.tmp_id, entry, current)
+    verified = []
+    for assignment, helper, proof in _terminal_stack_inputs_8616(
+        source, tuple(_iter_c_nodes_deep_8616(root)),
+    ):
+        layout = _loaded_word_far_return_layout_8616(codegen.project, proof.instruction_addr)
+        ss, pre_sp, cleanup = helper.args
+        tag = "inertia_word_far_return_cleanup"
+        if (
+            layout is None or proof not in capture.uses
+            or assignment.tags.get(tag) != layout.cleanup or helper.tags.get(tag) != layout.cleanup
+            or not isinstance(cleanup, c.CConstant) or cleanup.value != layout.cleanup
+            or not isinstance(ss, c.CVariable) or runtime_segment_name_for_variable_8616(ss.variable) != "ss"
+        ):
+            continue
+        lhs = runtime_gp_expression_view_8616(assignment.lhs)
+        rhs = assignment.rhs
+        if lhs is None or lhs.register_name != "esp" or not isinstance(rhs, c.CBinaryOp) or rhs.op != "Or":
+            continue
+        low = rhs.rhs
+        if (
+            not isinstance(low, c.CBinaryOp) or low.op != "And"
+            or not isinstance(low.rhs, c.CConstant) or low.rhs.value != 0xffff
+        ):
+            continue
+        value = low.lhs
+        if isinstance(value, c.CTypeCast) and call_stack_value_size_8616(value.dst_type) == 2:
+            value = value.expr
+        if value is not helper:
+            continue
+        high = _sp_value(rhs.lhs, equation)
+        before = _sp_value(pre_sp, equation)
+        if high is None or before is None:
+            continue
+        solver = z3.Solver()
+        solver.set(timeout=1000)
+        solver.add(z3.Or(
+            high != (current & 0xffff0000),
+            (before & 0xffff) != ((entry + proof.entry_sp_offset) & 0xffff),
+        ))
+        if solver.check() == z3.unsat:
+            verified.append(assignment)
+    return tuple(verified)
+
+
 def _unowned_sp_use(root: object, capture: object,
-                    contexts: object) -> cython.bint:
+                    contexts: object, terminal_writes=()) -> cython.bint:
     """Refuse retained/current SP observations not proved compatible with the ABI."""
     view: object
     context: object
@@ -223,6 +322,8 @@ def _unowned_sp_use(root: object, capture: object,
     allowed: set[cython.longlong] = set()
     if capture is not None:
         allowed.update(id(node) for node in builtins.iter(_iter_c_nodes_deep_8616(capture.assignment)))
+    for statement in terminal_writes:
+        allowed.update(id(node) for node in _iter_c_nodes_deep_8616(statement))
     for context in contexts:
         allowed.update(id(node) for node in builtins.iter(_iter_c_nodes_deep_8616(context.wrapper)))
     for node in _iter_c_nodes_deep_8616(root):
@@ -370,7 +471,9 @@ def _validate_call_inputs_8616(
             for item in iter(contexts))
         if count != 1:
             issues.append(CallStackInputIssue8616(CallStackInputIssueKind8616.MISSING, call.addr))
-    if contexts and _unowned_sp_use(root, capture, contexts):
+    if contexts and _unowned_sp_use(
+        root, capture, contexts, _verified_terminal_writes_8616(codegen, source, root, capture),
+    ):
         issues.append(CallStackInputIssue8616(CallStackInputIssueKind8616.INVALID, None))
     logical = _logical_view(root, contexts) if contexts else root
     return _CallStackInputObservation8616(logical, len(calls), len(contexts), tuple(issues))

@@ -546,6 +546,11 @@ def _callsite_window_8616(
     prefix: object
     encoded = _encoded_near_target_8616(entry)
     canonical = entry.target_addr
+    if encoded is None and entry.is_far:
+        encoded = entry.encoded_far_coordinates()
+        if encoded is None or type(canonical) is not int:
+            return None
+        return encoded[0], encoded[1], (encoded[1],)
     if encoded is None or type(canonical) is not int or canonical < 0:
         return None
     next_addr, raw_target = encoded
@@ -953,10 +958,12 @@ def _edge_invocation_premise_8616(
     encoded: object
     parent: object
     parent_surface: object
-    encoded = row.encoded_near_coordinates()
+    encoded = row.encoded_far_coordinates() if row.is_far else row.encoded_near_coordinates()
     if encoded is None or operator.eq(row.caller_start, callee_artifact.function_addr):
         return None
     raw_target = encoded[1]
+    if row.is_far and (raw_target != callee_artifact.function_addr or row.bound_far_transfer(project) is None):
+        return None
     parent = _registered_invocation_premise_8616(
         project, row.caller_start, row.callsite_addr, source, resolution
     )
@@ -1093,7 +1100,7 @@ def _retry_registered_parent_edges_8616(
     callsite_addr: cython.longlong,
     artifact: IRFunctionArtifact,
     boundary: ExactFunctionRangeBoundary8616,
-    coverage: IRBoundaryCoverageResult8616,
+    coverage: IRBoundaryCoverageResult8616 | None,
     records: object,
     source: Real16InvocationSource8616,
     resolution: _PremiseResolution8616,
@@ -1246,8 +1253,9 @@ def _raw_boot_invocation_premise_8616(
     )
     if artifact is None or _resolution_deadline_expired_8616(project, deadline):
         return None
+    surface = RawBootEntrySurface8616(artifact, boundary)
     premise = prove_real16_raw_boot_invocation_domain_8616(
-        project, RawBootEntrySurface8616(artifact, boundary), callsite_addr,
+        project, surface, callsite_addr,
         boot=source.boot, boot_recompute=source.boot_recompute,
         declared_services=source.declared_services,
     )
@@ -1623,8 +1631,15 @@ def _registered_surface_premise_8616(
     )
 
     surface = _caller_premise_surface_8616(project, head_addr)
-    if surface is None or _resolution_deadline_expired_8616(project, resolution.deadline):
+    if _resolution_deadline_expired_8616(project, resolution.deadline):
         return None
+    if surface is None:
+        # A selector-pending caller cannot enter the unconditional
+        # registry. Let a source-bound parent census authenticate its
+        # entry and close only the prefix needed by this demand.
+        return _selector_pending_caller_premise_8616(
+            project, head_addr, callsite_addr, source, resolution,
+        )
     artifact, boundary, coverage = surface
     premise = prove_real16_invocation_domain_8616(
         project,
@@ -1653,6 +1668,37 @@ def _registered_surface_premise_8616(
             premise.failure
             is Real16InvocationFailure8616.CALL_BOUNDARY_UNPROVEN
         ),
+    )
+
+
+@cython.ccall
+def _selector_pending_caller_premise_8616(
+    project: object, head_addr: cython.longlong, callsite_addr: cython.longlong,
+    source: Real16InvocationSource8616, resolution: _PremiseResolution8616,
+) -> Real16InvocationDomain8616 | None:
+    """Attempt an indexed local demand without publishing conditional IR."""
+    from .real16_boot_entry_link import RawBootEntrySurface8616, raw_boot_entry_surface_pending_8616
+    from .real16_invocation_domain import real16_native_census_import_8616
+
+    rows = tuple(row for row in source.callsite_index.for_target(head_addr)
+                 if (row.encoded_far_coordinates() if row.is_far else row.encoded_near_coordinates()) is not None)
+    if not rows or _resolution_deadline_expired_8616(project, resolution.deadline):
+        return None
+    registration = registered_function_ir_artifact_8616(project, head_addr)
+    if registration.failure is not FunctionIRArtifactFailure8616.NOT_REGISTERED:
+        return None
+    boundary = _exact_boundary_for_8616(project, head_addr)
+    if (boundary is None or boundary.project is not project or boundary.addr != head_addr
+            or _resolution_deadline_expired_8616(project, resolution.deadline)):
+        return None
+    artifact = real16_native_census_import_8616(project, boundary)
+    if (type(artifact) is not IRFunctionArtifact or artifact.function_addr != head_addr
+            or not raw_boot_entry_surface_pending_8616(RawBootEntrySurface8616(artifact, boundary))
+            or _resolution_deadline_expired_8616(project, resolution.deadline)):
+        return None
+    records = _prefix_records_8616(project, artifact, boundary, callsite_addr, resolution)
+    return _retry_registered_parent_edges_8616(
+        project, rows, callsite_addr, artifact, boundary, None, records, source, resolution,
     )
 
 
@@ -1784,6 +1830,31 @@ def _caller_invocation_premise_8616(
                 project, source, admission, artifact, boundary, callsite_addr,
                 entry_call_preservations, deadline=resolution.deadline,
             )
+        from .real16_boot_entry_link import RawBootEntrySurface8616
+        from .real16_invocation_domain import (
+            Real16InvocationFailure8616,
+            _invocation_boot_evidence_8616,
+            prove_real16_raw_boot_invocation_domain_8616,
+        )
+
+        boot_entry = _invocation_boot_evidence_8616(source.boot)
+        if (
+            not isinstance(boot_entry, Real16InvocationFailure8616)
+            and boot_entry.entry_linear == artifact.function_addr
+            and not _resolution_deadline_expired_8616(project, resolution.deadline)
+        ):
+            # The executable entry has no incoming CALL. Bind the exact
+            # in-flight artifact, replaying only through the demanded CALL.
+            boot_premise = prove_real16_raw_boot_invocation_domain_8616(
+                project, RawBootEntrySurface8616(artifact, boundary), callsite_addr,
+                boot=source.boot, boot_recompute=source.boot_recompute,
+                entry_call_preservations=entry_call_preservations,
+                declared_services=source.declared_services,
+            )
+            if _resolution_deadline_expired_8616(project, resolution.deadline):
+                return None
+            if boot_premise.complete:
+                return boot_premise
         for row in source.callsite_index.for_target(artifact.function_addr):
             if _resolution_deadline_expired_8616(project, resolution.deadline):
                 return None
@@ -2472,7 +2543,7 @@ def _decoded_entry_for_callsite_8616(
     callsite_addr: cython.longlong,
     resolver: DirectCallTargetResolver8616,
 ) -> DecodedDirectCallsite8616 | None:
-    """Return the unique indexed near-call entry for one exact callsite."""
+    """Return the unique indexed direct-call entry for one exact callsite."""
     instruction: object
     instruction = decoded_by_addr.get(callsite_addr)
     if instruction is None:
@@ -2483,12 +2554,16 @@ def _decoded_entry_for_callsite_8616(
     )
     if type(target_addr) is not int:
         return None
+    encoding = getattr(instruction, "bytes", None)
+    is_far = isinstance(resolved, DecodedFarCallTarget8616) or (
+        isinstance(encoding, (bytes, bytearray)) and len(encoding) == 5 and encoding[0] == 0x9A
+    )
     entries = tuple(
         entry
         for entry in builtins.iter(index.for_target(target_addr))
         if operator.eq(entry.callsite_addr, callsite_addr)
         and operator.eq(entry.caller_start, boundary.addr)
-        and not entry.is_far
+        and entry.is_far == is_far
     )
     return entries[0] if len(entries) == 1 else None
 
@@ -2963,6 +3038,26 @@ def _chained_nested_callsite_proof_8616(
     encoded: object
     if _resolution_deadline_expired_8616(project, resolution.deadline):
         return None
+    if entry.is_far:
+        # A closed far body can be replayed without a near-call binding.
+        # Derive the caller prefix at this site so scoped coverage and any
+        # preceding calls are checked before retaining the dependency.
+        prefix = _chained_nested_prefix_8616(
+            project, coverage, boundary, entry.callsite_addr, scope, prior_proofs,
+        )
+        if prefix is None or _resolution_deadline_expired_8616(project, resolution.deadline):
+            return None
+        closure, _failure = _callee_closure_8616(
+            project, window[1], resolution, callsite=entry,
+        )
+        if closure is None or _resolution_deadline_expired_8616(project, resolution.deadline):
+            return None
+        proof = prove_segment_call_preservation_8616(
+            coverage, closure, index, entry.callsite_addr, invocation=prefix,
+        )
+        if _resolution_deadline_expired_8616(project, resolution.deadline):
+            return None
+        return proof if proof.complete_for(scope) else None
     encoded = entry.encoded_near_coordinates()
     if encoded is None or (len(window[2]) == 1 and operator.ne(window[2][0], encoded[1])):
         return None
@@ -3113,6 +3208,7 @@ def _nested_callsite_proof_8616(
         nested,
         resolution,
         invocation_scope,
+        prior_proofs,
     )
 
 
@@ -3126,6 +3222,7 @@ def _complete_nested_callsite_proof_8616(
     nested: SegmentEffectClosureResult8616,
     resolution: _CalleeResolution8616,
     invocation_scope: object,
+    prior_proofs: object,
 ) -> SegmentCallPreservationResult8616 | None:
     """Finish a nested proof under the exact invocation and deadline scopes."""
     invocation: object
@@ -3134,9 +3231,13 @@ def _complete_nested_callsite_proof_8616(
     if coverage.scoped_view is not None:
         if invocation_scope is None:
             return None
-        invocation = _scoped_nested_premise_8616(
-            project, coverage, boundary, callsite_addr, invocation_scope,
+        invocation = _chained_nested_prefix_8616(
+            project, coverage, boundary, callsite_addr, invocation_scope, prior_proofs,
         )
+        if invocation is None:
+            invocation = _scoped_nested_premise_8616(
+                project, coverage, boundary, callsite_addr, invocation_scope,
+            )
         if invocation is None or _resolution_deadline_expired_8616(project, resolution.deadline):
             return None
     proof = prove_segment_call_preservation_8616(
@@ -3148,6 +3249,19 @@ def _complete_nested_callsite_proof_8616(
         invocation is None
         and proof.failure is SegmentCallPreservationFailure8616.TARGET_MISMATCH
     ):
+        if invocation_scope is not None:
+            invocation = _chained_nested_prefix_8616(
+                project, coverage, boundary, callsite_addr, invocation_scope, prior_proofs,
+            )
+            if _resolution_deadline_expired_8616(project, resolution.deadline):
+                return None
+            if invocation is not None:
+                retried = prove_segment_call_preservation_8616(
+                    coverage, nested, index, callsite_addr, invocation=invocation,
+                )
+                if (not _resolution_deadline_expired_8616(project, resolution.deadline)
+                    and retried.complete_for(invocation_scope)):
+                    return retried
         retried = _retried_nested_proof_8616(
             project, coverage, boundary, index, callsite_addr, nested,
             invocation_scope,

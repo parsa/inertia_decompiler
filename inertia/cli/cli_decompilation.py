@@ -2537,6 +2537,12 @@ def _republish_rewrite_evidence_after_regen_8616(codegen: object) -> None:
 @cython.ccall
 def _regenerate_codegen_text_safely(codegen: object, *, context: object) -> object:
     """Render the live C AST while preserving evidence-backed semantic materialization."""
+    if bool(getattr(codegen, "_inertia_legacy_cli_rewrite_refused_large_validated_ast", False)):
+        # Core Rewrite owns this AST. Refresh its text without recomputing
+        # local declarations or running any of the legacy semantic replay lanes.
+        live_codegen = typing.cast(typing.Any, codegen)
+        require_codegen_render_integrity_8616(codegen, context=context)
+        return _normalize_text_payload_8616(live_codegen.render_text(live_codegen.cfunc)), True
     try:
         return _regenerate_codegen_text_safely_impl(codegen, context=context)
     finally:
@@ -4747,7 +4753,17 @@ class _DecompileRun8616:
         result: object
         phase: object
         for phase in phases:
-            result = phase()
+            label = {
+                "phase_render_refresh_8616": "render:refresh",
+                "phase_text_normalize_8616": "render:normalize",
+            }.get(phase.__name__) if os.environ.get("INERTIA_DEBUG_TIMING") == "1" else None
+            if label is None:
+                result = phase()
+            else:
+                started = time.monotonic()
+                print(f"[dbg] stage-time: {label} start", flush=True)
+                result = phase()
+                print(f"[dbg] stage-time: {label} done elapsed={time.monotonic() - started:.3f}s", flush=True)
             if result is not None:
                 return result
         return None
@@ -9129,6 +9145,11 @@ def _decompile_function_with_stats(
         if detail.startswith("function leaked unresolved stack locals into final C"):
             detail = f"{function.name} leaked unresolved stack locals into final C"
         payload = f"Pipeline contract violation: {detail}{_pipeline_hard_error_context_8616(ex)}"
+        primary = getattr(project, "_inertia_primary_validation_failure_8616", None)
+        primary_detail = primary.get(getattr(function, "addr", None)) if isinstance(primary, dict) else None
+        if primary_detail and isinstance(ex.details, dict) and ex.details.get("verdict") == "stale":
+            # The stale-evidence refusal is a consequence; lead with its cause.
+            payload = f"Primary failure: {primary_detail}; consequent {payload}"
         terminal_failure = TerminalDecompileFailure8616(
             message=str(ex),
             layer=ex.layer,

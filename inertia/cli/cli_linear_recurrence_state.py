@@ -629,7 +629,7 @@ class LinearRecurrenceState:
         return self.canonicalize_stack_cvar_expr(expr, self.codegen)
 
     def expr_contains_dereference(self, expr: CExpr, active_expr_ids: object = None) -> cython.bint:
-        """Return whether an expression recursively contains a dereference."""
+        """Return whether copying the expression may replay a read or a call."""
 
         def _impl() -> cython.bint:
             nonlocal expr, active_expr_ids
@@ -657,12 +657,10 @@ class LinearRecurrenceState:
                 active_expr_ids.discard(expr_id)
                 return result
             if isinstance(expr, structured_c.CFunctionCall):
-                result = any(
-                    # Dynamic codegen boundary: function-call args are an optional angr C AST sequence.
-                    self.expr_contains_dereference(arg, active_expr_ids) for arg in iter(getattr(expr, "args", ()) or ())
-                )
+                # SEG_U8 and its siblings are calls in the C AST, even though
+                # their rendered macros read memory. No call purity is proven here.
                 active_expr_ids.discard(expr_id)
-                return result
+                return True
             active_expr_ids.discard(expr_id)
             return False
 

@@ -373,6 +373,7 @@ class RelativeDestination:
     target: int | None
     selector_min: cython.longlong
     selector_max: cython.longlong
+    alternatives: tuple[int, ...] = ()
 
 
 @cython.ccall
@@ -382,8 +383,31 @@ def _concrete_projection_only(value: object, width: object) -> NoReturn:
 
 
 @cython.ccall
+def bounded_relative_destination(
+    edge: DecodedRelativeEdge, minimum: cython.longlong, maximum: cython.longlong,
+) -> RelativeDestination:
+    """Prove the destination over an explicit inclusive selector interval.
+
+    Intersect the supplied interval with the selectors that can fetch the
+    entire contiguous encoding. The taken address is a step function of the selector;
+    word projections can cross at most one step in a single fetch window.
+    """
+    minimum = max(minimum, 0, (edge.next_head - 1 - 0xFFFF + 15) // 16)
+    maximum = min(maximum, 0xFFFF, edge.head // 16)
+    if minimum > maximum:
+        return RelativeDestination(RelativeDestinationVerdict.EMPTY_FETCH_DOMAIN, None, minimum, maximum)
+    first = edge.taken_control(minimum, _concrete_projection_only)
+    last = edge.taken_control(maximum, _concrete_projection_only)
+    if not isinstance(first, int) or not isinstance(last, int):
+        raise TypeError("concrete selector projection produced a symbolic destination")
+    if first != last:
+        return RelativeDestination(RelativeDestinationVerdict.SELECTOR_DEPENDENT, None, minimum, maximum, (first, last))
+    return RelativeDestination(RelativeDestinationVerdict.PROVEN, first, minimum, maximum)
+
+
+@cython.ccall
 def invariant_relative_destination(edge: DecodedRelativeEdge) -> RelativeDestination:
-    """Project a decoded edge under every CS capable of fetching its head.
+    """Project a decoded edge under every CS capable of fetching its encoding.
 
     WORD offsets are modular *inside* CS, never in loader coordinates.
     Fetch selectors form an interval whose base span is less than 65536.
@@ -393,14 +417,4 @@ def invariant_relative_destination(edge: DecodedRelativeEdge) -> RelativeDestina
     composition cancels the base modulo 2**32, so its endpoints also agree.
     This proves byte coordinates only; consumers must separately bind IR.
     """
-    minimum = max(0, (edge.head - 0xFFFF + 15) // 16)
-    maximum = min(0xFFFF, edge.head // 16)
-    if minimum > maximum:
-        return RelativeDestination(RelativeDestinationVerdict.EMPTY_FETCH_DOMAIN, None, minimum, maximum)
-    first = edge.taken_control(minimum, _concrete_projection_only)
-    last = edge.taken_control(maximum, _concrete_projection_only)
-    if not isinstance(first, int) or not isinstance(last, int):
-        raise TypeError("concrete selector projection produced a symbolic destination")
-    if first != last:
-        return RelativeDestination(RelativeDestinationVerdict.SELECTOR_DEPENDENT, None, minimum, maximum)
-    return RelativeDestination(RelativeDestinationVerdict.PROVEN, first, minimum, maximum)
+    return bounded_relative_destination(edge, 0, 0xFFFF)

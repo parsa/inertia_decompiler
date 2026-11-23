@@ -32,12 +32,57 @@ from .clinic_terminal_control import (
     transport_terminal_direct_jump_8616,
 )
 from .patch_dirty import apply_patch as _apply_dirty_patch
+from .opus_cs_census import census_selectors_8616
 from .stack_anchor_compat import apply_native_stack_anchor_compatibility_8616
 from .stack_compat import apply_x86_16_stack_compatibility as _apply_stack_compatibility
 from .typehoon_compat import apply_x86_16_typehoon_compatibility as _apply_typehoon_compatibility
 import operator
 
 __all__ = ["apply_x86_16_compatibility"]
+
+
+def _project_censused_far_call_cs_8616(project: object, block: object, converted: object) -> None:
+    """Keep caller CS on a continuation covered by the opt-in selector census.
+
+    The raw VEX still writes the callee's CS on the transfer to the callee.
+    This conditional caller-side projection does not assert that it returns,
+    or derive any effect on SP, memory, or other registers.
+    """
+    if not isinstance(converted, ailment.Block) or not converted.statements:
+        return
+    call = converted.statements[-1]
+    if not isinstance(call, ailment.Stmt.SideEffectStatement) or not isinstance(call.expr, ailment.Expr.Call):
+        return
+    site = call.tags.get("ins_addr")
+    if type(site) is not int:
+        return
+    selectors = census_selectors_8616(site)
+    if len(selectors) != 1 or census_selectors_8616(site + 5) != selectors:
+        return
+    base = selectors[0] << 4
+    if not base <= site <= site + 5 <= base + 0xffff:
+        return
+    # Match against the converted block's own ending instruction.
+    if block.addr + block.size != site + 5 or block.vex.jumpkind != "Ijk_Call":
+        return
+    encoding = bytes(block.bytes[-5:])
+    if len(encoding) != 5 or encoding[0] != 0x9a:
+        return
+    offset = int.from_bytes(encoding[1:3], "little")
+    selector = int.from_bytes(encoding[3:5], "little")
+    target = call.expr.target
+    if not isinstance(target, ailment.Expr.Const) or target.value != (((selector << 4) + offset) & 0xfffff):
+        return
+    cs_offset, cs_size = project.arch.registers["cs"]
+    matches = [
+        s for s in converted.statements[:-1]
+        if isinstance(s, ailment.Stmt.Assignment) and s.tags.get("ins_addr") == site
+        and isinstance(s.dst, ailment.Expr.Register) and s.dst.reg_offset == cs_offset
+        and s.dst.bits == cs_size * 8
+        and isinstance(s.src, ailment.Expr.Const) and s.src.value == selector
+    ]
+    if len(matches) == 1:
+        converted.statements = [s for s in converted.statements if s is not matches[0]]
 
 _OUT_HELPER_OPERAND_COUNT = 3
 
@@ -225,6 +270,7 @@ def _apply_clinic_custom_lifter_compatibility() -> None:
         converted = current_convert(clinic, block)
         if clinic.project.arch.name != "86_16":
             return converted
+        _project_censused_far_call_cs_8616(clinic.project, block, converted)
         converted, raw, _normalized, materialized, failures = _normalize_x86_16_io_dirty_statements(converted)
         if raw > 0 and materialized == 0:
             msg = f"x86-16 I/O effects were not materialized: raw={raw} failures={failures}"

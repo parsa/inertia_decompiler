@@ -20,6 +20,7 @@ from inertia.lowering.analysis_helpers import (
     interrupt_service_declarations,
     interrupt_service_spec,
 )
+from inertia.semantics.terminal_return_contract import WordInterruptReturnLayout8616
 
 from .gp_word_runtime import GPRegisterRuntimeABI8616, coherent_gp_runtime_header_8616
 from .near_pointer_value_runtime import NearPointerArgumentHelper8616, render_near_pointer_argument_runtime_8616
@@ -205,10 +206,83 @@ def render_near_pointer_arithmetic_macros_8616(target: object) -> object:
 
 
 @cython.ccall
+def render_word_far_return_runtime_8616() -> str:
+    """Render the word RETF runtime primitive after the segmented macros."""
+    iret = WordInterruptReturnLayout8616
+    return (
+        "extern uint16_t inertia_ip;\n"
+        "#ifndef INERTIA_RETF_BYTE\n"
+        "#define INERTIA_RETF_BYTE(ss, off) (*(volatile uint8_t far *)SEG_PTR((ss), (off)))\n"
+        "#endif\n"
+        "#ifndef INERTIA_CALL_FRAME_WRITE\n"
+        "#define INERTIA_CALL_FRAME_WRITE(ss, off, byte) (*(volatile uint8_t far *)SEG_PTR((ss), (off)) = (byte))\n"
+        "#endif\n"
+        "static uint16_t inertia_push_word(uint16_t ss, uint16_t sp, uint16_t value)\n"
+        "{\n"
+        "    sp = (uint16_t)(sp - 2u);\n"
+        "    INERTIA_CALL_FRAME_WRITE(ss, sp, (uint8_t)value);\n"
+        "    INERTIA_CALL_FRAME_WRITE(ss, (uint16_t)(sp + 1u), (uint8_t)(value >> 8));\n"
+        "    return sp;\n"
+        "}\n"
+        "static uint16_t inertia_stack_read_word(uint16_t ss, uint16_t sp)\n"
+        "{\n"
+        "    uint16_t value = INERTIA_RETF_BYTE(ss, sp);\n"
+        "    value |= (uint16_t)((uint16_t)INERTIA_RETF_BYTE(ss, (uint16_t)(sp + 1u)) << 8);\n"
+        "    return value;\n"
+        "}\n"
+        "static uint16_t inertia_call_far_word(uint16_t ss, uint16_t sp, uint16_t saved_ip, uint16_t target_cs, uint16_t target_ip)\n"
+        "{\n"
+        "    sp = inertia_push_word(ss, sp, inertia_cs);\n"
+        "    sp = inertia_push_word(ss, sp, saved_ip);\n"
+        "    inertia_cs = target_cs;\n"
+        "    inertia_ip = target_ip;\n"
+        "    return sp;\n"
+        "}\n"
+        "static uint16_t inertia_call_far_linear(uint16_t ss, uint16_t sp, uint32_t continuation, uint16_t target_cs, uint16_t target_ip)\n"
+        "{\n"
+        "    uint16_t saved_ip = (uint16_t)(continuation - ((uint32_t)inertia_cs << 4));\n"
+        "    return inertia_call_far_word(ss, sp, saved_ip, target_cs, target_ip);\n"
+        "}\n"
+        "static uint16_t inertia_ret_word(uint16_t ss, uint16_t sp, uint16_t cleanup)\n"
+        "{\n"
+        "    uint16_t ip;\n"
+        "    ip = inertia_stack_read_word(ss, sp);\n"
+        "    inertia_ip = ip;\n"
+        "    return (uint16_t)(sp + 2u + cleanup);\n"
+        "}\n"
+        "static uint16_t inertia_retf_word(uint16_t ss, uint16_t sp, uint16_t cleanup)\n"
+        "{\n"
+        "    uint16_t ip, cs;\n"
+        "    ip = inertia_stack_read_word(ss, sp);\n"
+        "    cs = inertia_stack_read_word(ss, (uint16_t)(sp + 2u));\n"
+        "    inertia_ip = ip;\n"
+        "    inertia_cs = cs;\n"
+        "    return (uint16_t)(sp + 4u + cleanup);\n"
+        "}\n"
+        "extern uint16_t inertia_flags;\n"
+        "static uint16_t inertia_iret_word(uint16_t ss, uint16_t sp)\n"
+        "{\n"
+        "    uint16_t ip, cs, flags;\n"
+        "    ip = INERTIA_RETF_BYTE(ss, sp);\n"
+        "    ip |= (uint16_t)((uint16_t)INERTIA_RETF_BYTE(ss, (uint16_t)(sp + 1u)) << 8);\n"
+        f"    cs = INERTIA_RETF_BYTE(ss, (uint16_t)(sp + {iret.cs_displacement}u));\n"
+        f"    cs |= (uint16_t)((uint16_t)INERTIA_RETF_BYTE(ss, (uint16_t)(sp + {iret.cs_displacement + 1}u)) << 8);\n"
+        f"    flags = INERTIA_RETF_BYTE(ss, (uint16_t)(sp + {iret.flags_displacement}u));\n"
+        f"    flags |= (uint16_t)((uint16_t)INERTIA_RETF_BYTE(ss, (uint16_t)(sp + {iret.flags_displacement + 1}u)) << 8);\n"
+        "    inertia_ip = ip;\n"
+        "    inertia_cs = cs;\n"
+        f"    inertia_flags = (uint16_t)((flags & {iret.flags_writable_mask}u) | {iret.flags_fixed_mask}u);\n"
+        f"    return (uint16_t)(sp + {iret.sp_displacement}u);\n"
+        "}\n"
+    )
+
+
+@cython.ccall
 def render_c_runtime_header_8616(
     target: object,
     *,
     gp_runtime_abi: GPRegisterRuntimeABI8616 = GPRegisterRuntimeABI8616.SCALAR,
+    word_far_return: bool = False,
 ) -> object:
     """Return the C helper header for the requested generated-C target."""
     normalized = str(target or "").strip().lower()
@@ -218,6 +292,7 @@ def render_c_runtime_header_8616(
     )
     runtime_helper_declarations = "\n".join(LOWERED_RUNTIME_HELPER_DECLARATIONS_8616.values())
     runtime_segment_state_declarations = "\n".join(_RUNTIME_SEGMENT_STATE_DECLARATIONS_8616)
+    far_return_runtime = render_word_far_return_runtime_8616() if word_far_return else ""
     if normalized == "msc-dos":
         compiler_helper_declarations = "\n".join(_MSC_COMPILER_RUNTIME_HELPER_DECLARATIONS_8616)
         return gp_header + (
@@ -250,6 +325,7 @@ def render_c_runtime_header_8616(
             f"{render_pointer_storage_macros_8616(normalized)}"
             f"{render_near_pointer_arithmetic_macros_8616(normalized)}"
             f"{render_near_pointer_argument_runtime_8616(normalized)}"
+            f"{far_return_runtime}"
         )
     if normalized == "portable-flat":
         compiler_helper_declarations = "\n".join(_PORTABLE_COMPILER_RUNTIME_HELPER_DECLARATIONS_8616)
@@ -284,6 +360,7 @@ def render_c_runtime_header_8616(
             f"{render_pointer_storage_macros_8616(normalized)}"
             f"{render_near_pointer_arithmetic_macros_8616(normalized)}"
             f"{render_near_pointer_argument_runtime_8616(normalized)}"
+            f"{far_return_runtime}"
         )
     return gp_header
 

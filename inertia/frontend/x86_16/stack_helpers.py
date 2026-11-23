@@ -15,6 +15,7 @@ from typing import Protocol, cast
 
 from pyvex.lifting.util import JumpKind
 from pyvex.lifting.util.vex_helper import Type
+from inertia.semantics.terminal_return_contract import WordFarReturnLayout8616, WordInterruptReturnLayout8616
 
 from .control_coordinates import (
     ControlAddressDomain,
@@ -458,10 +459,14 @@ def push_privilege_stack32(emu: StackEmulator) -> StackPair:
 
 
 @cython.ccall
-def pop_far_return_frame16(emu: StackEmulator) -> StackPair:
-    """Pop a 16-bit far-return IP:CS frame from SS:SP."""
-    ip = pop16(emu)
-    seg = pop16(emu)
+def pop_far_return_frame16(emu: StackEmulator, cleanup: cython.longlong = 0) -> StackPair:
+    """Capture IP then CS and publish the final SP after both reads."""
+    sp = emu.get_gpreg(reg16_t.SP)
+    layout = WordFarReturnLayout8616(cleanup)
+    cs_slot = sp + emu.constant(layout.cs_displacement, Type.int_16)
+    ip = emu.read_mem16_seg(sgreg_t.SS, sp, address_bits=16)
+    seg = emu.read_mem16_seg(sgreg_t.SS, cs_slot, address_bits=16)
+    emu.set_gpreg(reg16_t.SP, sp + emu.constant(layout.sp_displacement, Type.int_16))
     return ip, seg
 
 
@@ -681,9 +686,7 @@ def emit_far_jump32(emu: StackEmulator, segment: object, offset: object) -> obje
 @cython.ccall
 def return_far16(emu: StackEmulator, stack_adjust: cython.longlong = 0) -> StackPair:
     """Emit a 16-bit far return and restore CS:IP."""
-    ip, seg = pop_far_return_frame16(emu)
-    if stack_adjust:
-        emu.set_gpreg(reg16_t.SP, emu.get_gpreg(reg16_t.SP) + emu.constant(stack_adjust, Type.int_16))
+    ip, seg = pop_far_return_frame16(emu, stack_adjust)
     emu.set_sgreg(sgreg_t.CS, seg)
     emu.set_gpreg(reg16_t.IP, ip)
     emu.lifter_instruction.jump(None, _return_control_target(emu, seg, ip, ControlWidth.WORD), jumpkind=JumpKind.Ret)
@@ -694,7 +697,8 @@ def return_far16(emu: StackEmulator, stack_adjust: cython.longlong = 0) -> Stack
 def return_interrupt16(emu: StackEmulator) -> StackTriple:
     """Emit a 16-bit interrupt return and restore CS:IP plus FLAGS."""
     ip, cs, raw_flags = pop_interrupt_frame16(emu)
-    flags = _normalize_flags16(emu, raw_flags)
+    layout = WordInterruptReturnLayout8616
+    flags = _normalize_flags16(emu, raw_flags, layout.flags_writable_mask, layout.flags_fixed_mask)
     emu.set_gpreg(reg16_t.FLAGS, flags)
     emu.set_sgreg(sgreg_t.CS, cs)
     emu.set_gpreg(reg16_t.IP, ip)

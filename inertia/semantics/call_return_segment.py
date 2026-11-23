@@ -165,9 +165,11 @@ def _callee_refusal_8616(project: Project, target: cython.longlong) -> ReturnSeg
     callee: object
     frames: object
     callee = project.kb.functions.get(target)
-    if not isinstance(callee, Function):
-        return ReturnSegmentRefusal8616.UNKNOWN_CALLEE
-    if not callee.is_simprocedure and not callee.is_plt and not callee.block_addrs_set:
+    # A callee outside the recovered function set is classified by the same
+    # complete binary-reachability terminal census as a bodyless callee.
+    if not isinstance(callee, Function) or (
+        not callee.is_simprocedure and not callee.is_plt and not callee.block_addrs_set
+    ):
         evidence = callee_return_evidence_8616(project, target)
         if not evidence.complete:
             return ReturnSegmentRefusal8616.UNKNOWN_CALLEE

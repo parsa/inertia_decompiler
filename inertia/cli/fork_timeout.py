@@ -174,7 +174,9 @@ def _join_root_process_group() -> None:
 def _terminate_child(pid: cython.longlong, *, owns_process_group: cython.bint) -> None:
     """Kill a direct child and, for an outer timeout, every descendant group member."""
     if owns_process_group:
-        with contextlib.suppress(ProcessLookupError):
+        # macOS reports EPERM for a group whose only member is an unreaped
+        # zombie; the child's real exit status is reported by the caller.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
@@ -575,7 +577,8 @@ def run_with_timeout_in_fork(
                 os.waitpid(pid, 0)
         if owns_process_group:
             # The group can outlive its leader when nested work leaked a child.
-            with contextlib.suppress(ProcessLookupError):
+            # EPERM (macOS, reaped/zombie group) must not mask the real outcome.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pid, signal.SIGKILL)
             if guardian_pid is not None:
                 _reap_guardian_8616(guardian_pid)

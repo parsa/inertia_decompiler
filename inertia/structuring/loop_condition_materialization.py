@@ -27,12 +27,14 @@ from angr.analyses.decompiler.structured_codegen.c import (
     CAssignment,
     CBinaryOp,
     CConstant,
+    CContinue,
     CDirtyExpression,
     CDoWhileLoop,
     CExpression,
     CForLoop,
     CIfBreak,
     CIfElse,
+    CMultiStatementExpression,
     CStatement,
     CStatements,
     CUnaryOp,
@@ -919,6 +921,25 @@ class _LoopKeySelection8616:
             )
 
 
+def _hoist_guard_statements_into_do_while_body_8616(
+    loop: _LoopBoundary8616,
+    guard_statements: object,
+) -> cython.bint:
+    """Move a do-while guard's sequenced statements to the end of its body.
+
+    ``do { B } while ((S, c));`` equals ``do { B; S } while (c);`` unless B can
+    reach the guard through ``continue``, so any ``continue`` refuses the move.
+    """
+    if not isinstance(loop, CDoWhileLoop) or not isinstance(loop.body, CStatements):
+        return False
+    if not isinstance(guard_statements, CStatements):
+        return False
+    if any(isinstance(node, CContinue) for node in builtins.iter(_iter_c_nodes_deep_8616(loop.body))):
+        return False
+    loop.body.statements = [*(loop.body.statements or ()), *(guard_statements.statements or ())]
+    return True
+
+
 @cython.ccall
 def _materialize_loop_guard_8616(
     root: object,
@@ -996,6 +1017,12 @@ def _materialize_loop_guard_8616(
         )
     if edge is LoopContinuationEdge8616.FALLTHROUGH:
         replacement = _invert_condition_8616(replacement, codegen)
+    if isinstance(current, CMultiStatementExpression) and not isinstance(replacement, CMultiStatementExpression):
+        # The typed comparison reads its operands after the guard's sequenced
+        # statements (e.g. ``inc si; inc si; cmp si, imm``); dropping them would
+        # erase the loop-carried update.
+        if not _hoist_guard_statements_into_do_while_body_8616(loop, current.stmts):
+            replacement = CMultiStatementExpression(current.stmts, replacement, codegen=codegen)
     pretest_consumed = composite_ownership.owned_pretest_guard is not None
     if composite_ownership.owned_pretest_guard is not None and not _consume_owned_pretest_guard_8616(
         loop,

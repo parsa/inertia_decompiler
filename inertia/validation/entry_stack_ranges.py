@@ -27,6 +27,10 @@ from inertia.alias.segment_stack_restore import (
     SegmentStackRestoreVerdict8616,
 )
 from inertia.ir.vex_control_flow import terminal_ret_instruction_addrs_8616
+from inertia.semantics.terminal_stack_cleanup import (
+    TerminalReturnFrameKind8616,
+    terminal_stack_cleanup_at_address_8616,
+)
 from inertia.lowering.stack_function_coordinates import (
     c_function_stack_coordinate_projection_8616,
 )
@@ -46,6 +50,8 @@ _FIRST_ARGUMENT_BP_OFFSET_8616 = 4
 # an uninitialized stack-local read.
 _FAR_RETURN_CS_BP_OFFSET_8616 = 4
 _FAR_RETURN_CS_WIDTH_8616 = 2
+# RETF imm16 pops exactly imm16 caller-pushed argument bytes above that frame.
+_FAR_RETURN_FIRST_ARGUMENT_BP_OFFSET_8616 = 6
 
 __all__ = [
     "EntryStackRangeCollection8616",
@@ -183,7 +189,44 @@ def _far_return_cs_entry_ranges_8616(
                     width=_FAR_RETURN_CS_WIDTH_8616,
                 )
             )
+            cleanup_range = _far_return_cleanup_entry_range_8616(
+                boundary, fact.restore_instruction_addr,
+            )
+            if cleanup_range is not None:
+                ranges.append(cleanup_range)
     return tuple(sorted(tuple(set(ranges))))
+
+
+def _far_return_cleanup_entry_range_8616(
+    boundary: _CodegenBoundary8616,
+    restore_addr: object,
+) -> DefUseEntryStackRange8616 | None:
+    """Return the caller-pushed bytes a proven ``RETF imm16`` releases.
+
+    Every terminal path must agree on a 16-bit far frame and one even cleanup;
+    those bytes sit directly above the CS word and were defined by the caller.
+    """
+    try:
+        project = cast(typing.Any, boundary).project
+    except AttributeError:
+        return None
+    if project is None or not isinstance(restore_addr, int):
+        return None
+    evidence = terminal_stack_cleanup_at_address_8616(project, restore_addr)
+    cleanup = evidence.consistent_cleanup
+    if (
+        not evidence.complete
+        or evidence.consistent_return_frame_kind is not TerminalReturnFrameKind8616.FAR
+        or evidence.consistent_return_operand_bits != 16
+        or type(cleanup) is not int
+        or cleanup <= 0
+        or cleanup % 2
+    ):
+        return None
+    return DefUseEntryStackRange8616(
+        base_offset=_FAR_RETURN_FIRST_ARGUMENT_BP_OFFSET_8616,
+        width=cleanup,
+    )
 
 
 @cython.ccall

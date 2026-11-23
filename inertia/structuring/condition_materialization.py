@@ -872,6 +872,15 @@ def _condition_debug_tree_8616(condition: object, *, depth: cython.longlong = 0)
     """Return a bounded operator tree for opt-in condition diagnostics."""
     if depth >= 8:
         return ("depth-limit",)
+    if isinstance(condition, CITE):
+        return (
+            "ite",
+            _condition_debug_tree_8616(condition.cond, depth=depth + 1),
+            _condition_debug_tree_8616(condition.iftrue, depth=depth + 1),
+            _condition_debug_tree_8616(condition.iffalse, depth=depth + 1),
+        )
+    if isinstance(condition, CConstant):
+        return ("constant", condition.value)
     if isinstance(condition, CUnaryOp):
         return (
             "unary",
@@ -887,7 +896,14 @@ def _condition_debug_tree_8616(condition: object, *, depth: cython.longlong = 0)
         )
     if isinstance(condition, CVariable) and isinstance(condition.variable, SimStackVariable):
         variable = condition.variable
-        return ("stack-variable", variable.base, variable.offset, variable.size, tuple(sorted(condition.tags)))
+        owner = condition.unified_variable
+        return (
+            "stack-variable", variable.base, variable.offset, variable.size, variable.region,
+            condition.type.size,
+            (owner.base, owner.offset, owner.size, owner.region) if isinstance(owner, SimStackVariable)
+            else type(owner).__name__,
+            tuple(sorted(condition.tags)),
+        )
     return (type(condition).__name__,)
 
 
@@ -2167,6 +2183,8 @@ def _materialize_cfg_single_branch_expr_8616(
     continuation: int | None = None,
 ) -> CExpression | None:
     """Orient one no-else branch from typed targets and exclusive CFG reachability."""
+    if _legacy_typed_conditions.condition_replacement_would_reload_comparison_8616(structured_condition, condition):
+        return None
     body_return: object
     chained_target: object
     early: object
@@ -3114,6 +3132,57 @@ class _ConditionChainRun8616:
             return
         root_fact = arm.root_fact
         assert root_fact is not None
+        if _legacy_typed_conditions.condition_replacement_would_reload_comparison_8616(arm.condition, root_fact):
+            from inertia.structuring.captured_condition_definitions import (
+                captured_byte_guard_8616, captured_word_compare_8616, promoted_stack_test_8616,
+            )
+
+            orientation = _single_branch_body_orientation_8616(root_fact, arm.body, self.successors)
+            exact_edges = (
+                orientation is not None
+                and _first_tagged_ins_addr_8616(arm.body) == (
+                    root_fact.taken_target if orientation else root_fact.fallthrough_target
+                )
+                and (arm.node.else_node is None or _first_tagged_ins_addr_8616(arm.node.else_node) == (
+                    root_fact.fallthrough_target if orientation else root_fact.taken_target
+                ))
+            )
+            stack_test = exact_edges and promoted_stack_test_8616(
+                arm.condition, root_fact, body_is_taken=orientation,
+            )
+            byte_guard = exact_edges and captured_byte_guard_8616(
+                self.codegen.cfunc.statements, arm.node, arm.condition, root_fact, body_is_taken=orientation,
+            )
+            proven = stack_test or byte_guard or (
+                arm.node.else_node is None
+                and orientation is not None
+                and captured_word_compare_8616(
+                    self.codegen.cfunc.statements, arm.condition, root_fact, body_is_taken=orientation,
+                )
+            )
+            _debug_condition_chain_8616(
+                "captured-comparison-preserved",
+                body_is_taken=orientation,
+                proven=proven,
+                fact_block=root_fact.block_addr,
+                fact_src=root_fact.src_insn,
+                fact_op=root_fact.op,
+                fact_width=root_fact.width_bits,
+                has_else=arm.node.else_node is not None,
+                fact_lhs=root_fact.lhs,
+                fact_rhs=root_fact.rhs,
+                producer_semantics=root_fact.producer_semantics,
+                guard=_condition_debug_tree_8616(arm.condition)
+                if os.environ.get("INERTIA_DEBUG_CONDITION_MATERIALIZATION") == "1" else None,
+            )
+            if proven:
+                arm.condition.tags["inertia_structuring_condition_cfg_materialized_8616"] = True
+                arm.condition.tags[
+                    "inertia_structuring_promoted_stack_test_8616" if stack_test
+                    else "inertia_structuring_captured_byte_guard_8616" if byte_guard
+                    else "inertia_structuring_captured_word_compare_8616"
+                ] = True
+            return
         self.raw_count += 1
         if not arm.semantic_owner_proven and not _structured_node_owns_condition_fact_8616(
             arm.node_ins_addr, root_fact, self.successors, self.condition_blocks

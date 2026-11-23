@@ -9,6 +9,8 @@ Consumes alias, widening, and typed facts
 Do not recover semantics from COD, source, assembly, or rendered C text
 """
 from __future__ import annotations
+import logging
+import os
 import typing
 import cython
 
@@ -29,6 +31,9 @@ from inertia.alias.scoped_call_stack_positions import (
 )
 from inertia.ir.core import IRFunctionArtifact
 from inertia.ir.real16_invocation_domain import Real16InvocationDomain8616
+from inertia.alias.numeric_stack_pointer_values import (
+    TerminalStackPointerInput8616, prove_terminal_stack_pointer_input_8616,
+)
 from inertia.semantics.numeric_stack_pointer_returns import (
     NumericStackPointerReturn8616,
     prove_numeric_stack_pointer_return_8616,
@@ -41,6 +46,13 @@ import operator
 import builtins
 
 _CAPTURE_TAG = "inertia_entry_sp_capture_8616"
+
+
+def is_entry_stack_pointer_capture_8616(node: object) -> bool:
+    """Identify a capture owner for passes inserting other entry initializers."""
+    return isinstance(node, c.CAssignment) and isinstance(
+        node.tags.get(_CAPTURE_TAG), EntryStackPointerCapture8616,
+    )
 _WORD_MASK = 0xffff
 
 
@@ -126,6 +138,7 @@ class ScopedCallPositionAuthority8616:
 
 EntryStackPointerUse8616 = typing.TypeAliasType("EntryStackPointerUse8616", (
     NumericStackPointerReturn8616
+    | TerminalStackPointerInput8616
     | CallStackPosition8616
     | ScopedCallPositionAuthority8616
 ))
@@ -374,6 +387,8 @@ def _use_order(use: EntryStackPointerUse8616) -> tuple[cython.longlong, cython.l
     if isinstance(use, NumericStackPointerReturn8616):
         assignment = use.assignment
         return (0, assignment.block_addr, assignment.instruction_index, assignment.instruction_addr, use.path.return_addr)
+    if isinstance(use, TerminalStackPointerInput8616):
+        return (2, use.block_addr, 0, use.instruction_addr, 0)
     position = _use_position(use)
     if position is None:
         return (2, 0, 0, 0, 0)
@@ -391,6 +406,8 @@ def _use_is_current(
     if isinstance(use, NumericStackPointerReturn8616):
         current = prove_numeric_stack_pointer_return_8616(source, use.assignment.block_addr, use.path.return_addr)
         return current == use
+    if isinstance(use, TerminalStackPointerInput8616):
+        return prove_terminal_stack_pointer_input_8616(source, use.block_addr, use.instruction_addr) == use
     if isinstance(use, ScopedCallPositionAuthority8616):
         return use.is_current_for(source, scoped_context=scoped_context,
                                   scoped_caller_scope=scoped_caller_scope)
@@ -408,7 +425,7 @@ def _retained_uses(captures: object) -> object:
     marker = captures[0].tags[_CAPTURE_TAG]
     if not isinstance(marker, EntryStackPointerCapture8616) or not isinstance(marker.uses, tuple):
         return None
-    if not all(isinstance(use, (NumericStackPointerReturn8616, CallStackPosition8616,
+    if not all(isinstance(use, (NumericStackPointerReturn8616, TerminalStackPointerInput8616, CallStackPosition8616,
                                 ScopedCallPositionAuthority8616)) for use in iter(marker.uses)):
         return None
     return marker.uses
@@ -491,9 +508,22 @@ def observe_entry_stack_pointer_capture_8616(
     uses = _retained_uses(captures)
     if (len(captures) != 1 or not uses or not all(
             _use_is_current(source, use, scoped_context, scoped_caller_scope) for use in iter(uses))):
+        if captures and os.environ.get("INERTIA_TRACE_CALL_STACK_POSITION") == "1":
+            logging.getLogger(__name__).warning(
+                "Entry SP capture authority stale: captures=%d uses=%r", len(captures), uses,
+            )
         return None
     expected = runtime_gp_state_expr_8616("sp", codegen=codegen, function_addr=function.addr)
     if expected is None:
         return None
     value = _existing_capture_value_8616(function, captures[0], expected)
+    if value is None and os.environ.get("INERTIA_TRACE_CALL_STACK_POSITION") == "1":
+        assignment = captures[0]
+        root = function.statements
+        logging.getLogger(__name__).warning(
+            "Entry SP capture shape stale: first=%s same_read=%s immutable=%s lhs_type=%s rhs_type=%s expected_type=%s",
+            isinstance(root, c.CStatements) and bool(root.statements) and root.statements[0] is assignment,
+            _same_runtime_read(assignment.rhs, expected), _capture_is_immutable(root, assignment),
+            assignment.lhs.type, assignment.rhs.type, expected.type,
+        )
     return None if value is None else EntryStackPointerCaptureObservation8616(captures[0], value, uses)

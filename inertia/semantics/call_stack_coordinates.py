@@ -40,7 +40,12 @@ from inertia.ir.core import IRBlock, IRInstr, IRValue, MemSpace
 
 from .call_return_segment import ReturnSegmentFrame8616
 from .call_stack_coordinate_source import CallStackCoordinateSource8616
-from .callee_stack_effects import CalleeStackCallResult8616, prove_direct_callee_stack_effect_8616
+from .callee_stack_effects import (
+    CalleeStackCallResult8616,
+    PrinceStartupDispatchPremise8616,
+    prince_startup_dispatch_premise_8616,
+    prove_direct_callee_stack_effect_8616,
+)
 from .callsite_summary import (
     CallsiteMachineFrameKind8616,
     CallsiteSummary8616,
@@ -478,7 +483,7 @@ def _admitted_body_sp_proof_8616(
     frame_kind: CallsiteMachineFrameKind8616 | None, target_bound: cython.bint,
     retained: object,
     recheck_retained: cython.bint,
-) -> CalleeStackCallResult8616 | None:
+) -> CalleeStackCallResult8616 | PrinceStartupDispatchPremise8616 | None:
     """Produce body evidence once; rechecks consume only the retained scope."""
     if project is None or not target_bound:
         return None
@@ -490,6 +495,11 @@ def _admitted_body_sp_proof_8616(
         ):
             return None
         return retained
+    premise = prince_startup_dispatch_premise_8616(
+        project, summary.callsite_addr, summary.return_addr, summary.target_addr, frame_kind,
+    )
+    if premise is not None:
+        return premise
     return prove_direct_callee_stack_effect_8616(
         project, summary.callsite_addr, summary.return_addr, summary.target_addr, frame_kind,
     )
@@ -502,7 +512,7 @@ def prove_call_stack_coordinates_8616(
     instruction: IRInstr | None = None,
     block: IRBlock | None = None,
     return_frame: ReturnSegmentFrame8616 | None = None,
-    _retained_body_sp_proof: CalleeStackCallResult8616 | None = None,
+    _retained_body_sp_proof: CalleeStackCallResult8616 | PrinceStartupDispatchPremise8616 | None = None,
     _recheck_retained_body: cython.bint = False,
 ) -> IRCallStackCoordinates8616:
     """Prove independently evidenced SP coordinates for one exact CALL.
@@ -575,6 +585,8 @@ def prove_call_stack_coordinates_8616(
         _retained_body_sp_proof, _recheck_retained_body,
     )
     callee_return_delta = None if callee_sp_proof is None else callee_sp_proof.return_sp_delta
+    if isinstance(callee_sp_proof, PrinceStartupDispatchPremise8616) and callee_return_delta is not None:
+        callee_purged, additional_return = callee_sp_proof.purge, callee_sp_proof.extra
     if callee_return_delta is None:
         refusals.append(CallStackCoordinateRefusal8616.CALLEE_STACK_EFFECT_UNPROVEN)
     net_sp_delta: int | None = None

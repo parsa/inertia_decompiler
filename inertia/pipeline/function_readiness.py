@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from os import getpid
+from os import getenv, getpid
 from typing import Protocol, cast
 
 from inertia.ir.core import IRCallStackEffect8616, IRValue
@@ -629,12 +629,16 @@ def _prior_evidence_block_8616(
             FunctionStageFailure8616.EVIDENCE_NOT_REPRESENTABLE,
         )
     if operator.ne(live, evidence.outputs):
+        if getenv("INERTIA_DEBUG_STAGE_READINESS"):
+            print("[stage-readiness-output-mismatch]", prior, evidence.producer, evidence.outputs, live)
         return _PriorBlock8616(
             FunctionStageVerdict8616.STALE,
             FunctionStageFailure8616.UPSTREAM_EVIDENCE_CHANGED,
         )
     for declared in evidence.inputs:
         if not input_alive(declared):
+            if getenv("INERTIA_DEBUG_STAGE_READINESS"):
+                print("[stage-readiness-input-mismatch]", prior, evidence.producer, declared)
             return _PriorBlock8616(
                 FunctionStageVerdict8616.STALE,
                 FunctionStageFailure8616.UPSTREAM_EVIDENCE_CHANGED,
